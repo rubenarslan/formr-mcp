@@ -99,7 +99,23 @@ Set `FORMR_BASE_URL`, `FORMR_CLIENT_ID`, and `FORMR_CLIENT_SECRET` in a `.env` f
 | `get_run` | Get run metadata by exact name |
 | `create_run` | Create a new empty run |
 | `delete_run` | Permanently delete a run and all its data |
-| `whoami` | Get the authenticated user's profile |
+| `whoami` | Identify the user **and report this token's capabilities** — granted scopes, read-only/run-allowlist limits, data-access mode, and a per-tool availability map. Call this first. |
+
+### Reading Data
+
+| Tool | Description |
+|---|---|
+| `list_sessions` | List participant sessions (code, position, ended, testing flag) |
+| `get_session` | Get one session by its code |
+| `list_unit_sessions` | Per-unit history for progress / dropout / trajectory analysis |
+| `get_run_results` | Raw survey responses, keyed by survey (filter by survey/session/item) |
+| `list_run_files` | List uploaded-file metadata |
+| `get_survey_structure` | Survey item definitions and choice lists (not participant data) |
+
+> **Data-access gate (GDPR).** `FORMR_DATA_ACCESS` sets a hard ceiling on what the read
+> tools may return: `test_only` (the default) exposes only test sessions (`testing=1`);
+> `all` exposes real participant data. Per-call test/real filters apply within the ceiling
+> but can never exceed it. See `.env.example` and the `data-access` documentation topic.
 
 ### Structure Editing
 

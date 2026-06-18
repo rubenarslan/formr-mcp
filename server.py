@@ -18,7 +18,8 @@ dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 load_dotenv(dotenv_path)
 
 from formr_mcp.auth import AuthError, check_credentials
-from formr_mcp.client import FormrClient, FormrClientError
+from formr_mcp.client import FormrClient, FormrClientError, FormrPermissionError
+from formr_mcp import data_access as gate
 from formr_mcp import documentation as doc
 from formr_mcp import patterns as patterns_lib
 from formr_mcp.analysis import analyze_run as run_analysis
@@ -50,6 +51,64 @@ VALID_SETTINGS = {
     "expire_cookie_value", "expire_cookie_unit", "public", "locked",
 }
 
+# OAuth scope each API-backed tool needs. Used by whoami to report which
+# tools this token can actually use. Local/file/doc tools are omitted
+# (they need no API scope and are always available).
+TOOL_SCOPES = {
+    "list_runs": "run:read",
+    "get_run": "run:read",
+    "get_run_structure_to_file": "run:read",
+    "create_run": "run:write",
+    "delete_run": "run:write",
+    "update_run_settings": "run:write",
+    "update_run_structure_from_file": "run:write",
+    "list_sessions": "session:read",
+    "get_session": "session:read",
+    "list_unit_sessions": "session:read",
+    "get_run_results": "data:read",
+    "list_run_files": "file:read",
+    "get_survey_structure": "survey:read",
+}
+_WRITE_SCOPES = {"run:write", "survey:write", "session:write", "user:write", "file:write"}
+
+
+def _build_capability_report(caps: dict, token_scopes: list[str]) -> dict:
+    """Turn raw /user/me capabilities into a usable report: granted scopes,
+    a plain-English access summary, the data ceiling, and a per-tool map."""
+    scopes = caps.get("scopes") if isinstance(caps.get("scopes"), list) else token_scopes
+    scope_set = set(scopes or [])
+    allowed_runs = caps.get("allowed_runs")  # None = unrestricted, else [{id,name}]
+    mode = gate.data_access_mode()
+
+    parts = []
+    if scope_set & _WRITE_SCOPES:
+        parts.append("read-write")
+    else:
+        parts.append("READ-ONLY (no write scopes)")
+    if allowed_runs:
+        names = ", ".join(r.get("name", "?") for r in allowed_runs)
+        parts.append(f"limited to run(s): {names}")
+    else:
+        parts.append("all owned runs")
+    summary = "; ".join(parts)
+
+    tool_access = {}
+    for tool, scope in TOOL_SCOPES.items():
+        if scope not in scope_set:
+            tool_access[tool] = f"blocked: requires '{scope}' scope"
+        elif tool == "get_run_results" and mode == gate.TEST_ONLY:
+            tool_access[tool] = "available: TEST sessions only (FORMR_DATA_ACCESS=test_only)"
+        else:
+            tool_access[tool] = "available"
+
+    return {
+        "scopes": sorted(scope_set),
+        "access_summary": summary,
+        "data_access_mode": mode,
+        "allowed_runs": allowed_runs,
+        "tool_access": tool_access,
+    }
+
 
 @asynccontextmanager
 async def lifespan(server: FastMCP) -> AsyncIterator[FormrClient]:
@@ -78,8 +137,26 @@ mcp = FastMCP(
 
 SETUP: The user must configure a .env file with formr API credentials:
   FORMR_BASE_URL, FORMR_CLIENT_ID, FORMR_CLIENT_SECRET
-Required scopes: survey:read, run:read, run:write, data:read (admin >= 2).
-If tools return auth errors, the .env file is missing or misconfigured.
+Scopes are fixed per credential. Design/edit needs run:read + run:write; reading
+data needs session:read (sessions), data:read (results), file:read (files),
+survey:read (item defs). A token may be READ-ONLY or limited to specific runs.
+Call whoami FIRST — it reports this token's granted scopes, run allowlist, and
+which tools are usable. If tools return auth errors, .env is missing/misconfigured.
+
+CAPABILITIES & LIMITS: Tokens carry fixed scopes (read-only vs read-write) and an
+optional run allowlist (e.g. a single run). whoami surfaces all of this so you can
+tell the user up front what they can do, instead of hitting opaque 403s.
+
+READING DATA — six read tools inspect a live run (handy for designing/debugging):
+  list_sessions / get_session     who is in the run, position, testing flag
+  list_unit_sessions              per-unit history: progress, dropout, trajectories
+  get_run_results                 raw survey responses (filter by survey/session/item)
+  list_run_files                  uploaded-file metadata
+  get_survey_structure            item tables + choice lists (definitions, not data)
+DATA GATE (GDPR): FORMR_DATA_ACCESS sets a HARD ceiling, default `test_only` —
+only test sessions (testing=1) are ever readable; reads of real participant data
+are refused until an operator sets FORMR_DATA_ACCESS=all and restarts. For
+full-scale analysis prefer emitting R code for RStudio (see data-access docs).
 
 formr is a survey framework for psychology research. Runs are ordered
 compositions of units (Surveys, Pages, Emails, Branches, etc.) where
@@ -113,8 +190,26 @@ def _client(ctx: Context) -> FormrClient:
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def whoami(ctx: Context = None) -> dict:
-    """Get the authenticated user's profile."""
-    return await _client(ctx).get_user_me()
+    """Identify the authenticated user AND report this token's capabilities.
+
+    Call this first. Returns the user profile plus a `capabilities` block:
+      - scopes: the OAuth scopes this token was granted
+      - access_summary: plain-English (e.g. "READ-ONLY; limited to run(s): foo")
+      - data_access_mode: test_only (default) or all — the GDPR ceiling
+      - allowed_runs: null if unrestricted, else the runs this token may touch
+      - tool_access: each data/run tool -> available | blocked (missing scope) | test-only
+
+    Use this to tell the user up front what they can and cannot do, rather than
+    discovering limits through 403 errors mid-task.
+    """
+    client = _client(ctx)
+    caps = await client.get_capabilities()
+    token_scopes = await client.scopes()
+    profile = {k: v for k, v in caps.items() if k not in ("scopes", "allowed_runs", "admin")}
+    if "admin" in caps:
+        profile["admin"] = caps["admin"]
+    profile["capabilities"] = _build_capability_report(caps, token_scopes)
+    return profile
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -491,6 +586,91 @@ async def open_flowchart(name: RunName, ctx: Context = None) -> str:
     webbrowser.open(result["url"])
 
     return f"Flowchart link for run '{name}' (expires in 24h):\n\n  {result['url']}"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def list_sessions(name: RunName, active: bool | None = None, testing: bool | None = None,
+                        limit: int = 100, offset: int = 0, ctx: Context = None) -> list[dict]:
+    """List participant sessions in a run: session code, position, created/last_access/ended,
+    testing flag, and current unit. Useful for checking who's in the run and how far they got.
+
+    Filters: active (True=ongoing, False=finished, None=all); testing (True=test, False=real,
+    None=both) — but the FORMR_DATA_ACCESS ceiling applies (default test_only forces test-only
+    and refuses testing=False). Paginate with limit (max 10000) / offset. Scope: session:read.
+    """
+    validate_run_name(name)
+    effective = gate.resolve_testing(testing)
+    return await _client(ctx).get_sessions(name, active=active, testing=effective,
+                                           limit=limit, offset=offset)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_session(name: RunName, code: str, ctx: Context = None) -> dict:
+    """Get one session in a run by its session code (full detail incl. current unit).
+
+    Under FORMR_DATA_ACCESS=test_only, fetching a real participant's session is refused.
+    Scope: session:read.
+    """
+    validate_run_name(name)
+    sess = await _client(ctx).get_session(name, code)
+    if gate.data_access_mode() == gate.TEST_ONLY and not gate.is_test_session(sess):
+        raise gate.DataAccessError(
+            f"Session '{code}' is a real participant; FORMR_DATA_ACCESS=test_only blocks "
+            "reading real participant data. Set FORMR_DATA_ACCESS=all to enable."
+        )
+    return sess
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def list_unit_sessions(name: RunName, session: str | None = None, testing: bool | None = None,
+                             since: str | None = None, limit: int = 1000, offset: int = 0,
+                             ctx: Context = None) -> list[dict]:
+    """Per-unit interaction history (one row per participant x unit x iteration): unit type,
+    position, created/ended/expired, result, state. The basis for progress, dropout, and
+    trajectory (Sankey/alluvial) analysis.
+
+    Filters: session (comma-separated codes); testing (subject to the FORMR_DATA_ACCESS ceiling);
+    since (ISO 8601, for incremental polling). Paginate with limit/offset. Scope: session:read.
+    """
+    validate_run_name(name)
+    effective = gate.resolve_testing(testing)
+    return await _client(ctx).get_unit_sessions(name, session=session, testing=effective,
+                                                since=since, limit=limit, offset=offset)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_run_results(name: RunName, surveys: list[str] | None = None,
+                          sessions: list[str] | None = None, items: list[str] | None = None,
+                          testing: bool | None = None, ctx: Context = None) -> dict:
+    """Fetch raw survey responses for a run, as an object keyed by survey name (each value a
+    list of response rows). Filter by surveys, sessions (codes), and/or items.
+
+    GDPR gate: under FORMR_DATA_ACCESS=test_only (default) only test-session rows are returned —
+    enforced by resolving test session codes first and passing them as the session filter, since
+    the results endpoint has no testing filter of its own. testing=False is refused in test_only
+    mode. Returns {} when no sessions match the constraint. Scope: data:read.
+    """
+    validate_run_name(name)
+    return await gate.get_results_gated(_client(ctx), name, surveys=surveys,
+                                        sessions=sessions, items=items, testing=testing)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def list_run_files(name: RunName, ctx: Context = None) -> list[dict]:
+    """List files uploaded to a run — metadata only (id, name, path, url, timestamps).
+    Does not download file contents. Scope: file:read.
+    """
+    validate_run_name(name)
+    return await _client(ctx).get_run_files(name)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_survey_structure(survey: str, ctx: Context = None) -> dict:
+    """Get a survey's item definitions as JSON: item names, types, labels, and choice lists.
+    This is survey DESIGN (definitions), not participant data, so it is not gated. Use it to
+    inspect items/choices while designing or debugging a run. Scope: survey:read.
+    """
+    return await _client(ctx).get_survey(survey, "json")
 
 
 if __name__ == "__main__":

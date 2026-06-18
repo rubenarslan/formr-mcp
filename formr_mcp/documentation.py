@@ -2244,6 +2244,38 @@ def _data_access():
 If you need a number, percentage, or list that covers **more than one participant**,
 you need the V1 API.
 
+## Reading data through the MCP (read tools + the GDPR gate)
+
+The MCP can read a live run directly — useful while designing or debugging:
+
+| Tool | Returns | Scope |
+|------|---------|-------|
+| `list_sessions` / `get_session` | who is in the run, position, ended, testing flag | session:read |
+| `list_unit_sessions` | per-unit history: progress, dropout, trajectories | session:read |
+| `get_run_results` | raw survey responses (filter by survey/session/item) | data:read |
+| `list_run_files` | uploaded-file metadata | file:read |
+| `get_survey_structure` | item tables + choice lists (definitions, not data) | survey:read |
+
+**Token limits are surfaced, not guessed.** Call `whoami` first: it reports the
+token's granted scopes, whether it is read-only, its run allowlist (e.g. "limited
+to run X"), and a per-tool availability map. Don't infer limits from 403s — read
+them from `whoami`.
+
+**The data gate (`FORMR_DATA_ACCESS`).** This server-level env var is a hard ceiling
+on what the MCP may read:
+
+- `test_only` (default) — only **test** sessions (`testing=1`) are ever readable.
+  `list_sessions`/`list_unit_sessions`/`get_run_results` silently restrict to test
+  data; `get_session` on a real participant and any explicit `testing=false` are
+  refused. This is the GDPR-safe default.
+- `all` — real participant data is readable; you may still filter test/real per call.
+
+Note `get_run_results` enforces the ceiling by first resolving the matching session
+codes (via the sessions endpoint) and passing them as the `sessions` filter, because
+the results endpoint itself has no testing filter. It returns `{}` when nothing matches
+(e.g. no test sessions yet). For analysing a full real dataset, still prefer emitting
+R code for the researcher's RStudio session (below) over pulling everything into context.
+
 ## When to reach for the V1 API
 
 Reach for `formr_api_*` whenever you need to:
@@ -2324,8 +2356,10 @@ sessions <- formr_api_sessions("my-diary-run")
 table(sessions$position)
 ```
 
-> The LLM should produce R code as an artifact for the researcher to run
-> in RStudio — never attempt to fetch or process participant data itself.
+> For full-scale analysis (downloading and processing an entire dataset),
+> produce R code as an artifact for the researcher to run in RStudio. The MCP
+> read tools (below) are for inspecting and debugging a run during design —
+> not a substitute for a proper analysis session.
 
 ## Key V1 API functions
 
