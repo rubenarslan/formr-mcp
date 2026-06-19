@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server as server_mod
 from server import VALID_SETTINGS, _normalize_survey_choices
-from formr_mcp.utils import run_filepath
+from formr_mcp.utils import run_filepath, validate_run_name
 
 
 class TestValidSettings:
@@ -86,9 +86,31 @@ class TestRunFilepath:
         with pytest.raises(ValueError, match="Invalid run name"):
             run_filepath("ab")
 
-    def test_rejects_uppercase(self):
-        with pytest.raises(ValueError, match="Invalid run name"):
-            run_filepath("My-Run")
+
+class TestRunNameParityWithFormr:
+    # formr's rule (RunResource.php): /^[a-zA-Z][a-zA-Z0-9-]{2,255}$/
+    # The MCP must accept everything formr accepts (not be stricter).
+    def test_accepts_uppercase_and_mixed(self):
+        for ok in ("My-Run", "ABC", "MixedCase123", "a-B-3"):
+            validate_run_name(ok)  # must not raise
+
+    def test_accepts_max_length_256(self):
+        validate_run_name("A" + "a" * 255)  # 256 chars — formr's max
+
+    def test_rejects_too_long_257(self):
+        with pytest.raises(ValueError):
+            validate_run_name("A" + "a" * 256)  # 257 chars
+
+    def test_rejects_leading_digit_and_specials(self):
+        for bad in ("1run", "-run", "run_name", "run.name", "ru"):
+            with pytest.raises(ValueError):
+                validate_run_name(bad)
+
+    def test_accepts_uppercase(self, tmp_path, monkeypatch):
+        # formr allows uppercase (RunResource.php: [a-zA-Z]); the MCP must not be stricter.
+        monkeypatch.setattr("formr_mcp.utils.WORKSPACE_DIR", tmp_path / "ws")
+        path = run_filepath("My-Run")
+        assert path.name == "My-Run.json"
 
 
 class TestGetRunStructureToFile:
@@ -199,3 +221,49 @@ class TestUpdateRunStructureFromFile:
 
         assert filepath.exists()
         assert bak.exists()
+
+
+class TestInlineStructureTools:
+    def test_get_run_structure_returns_json_text(self, monkeypatch):
+        mock_client = AsyncMock()
+        mock_client.get_run_structure.return_value = {
+            "units": [{"type": "Survey", "position": 10}]
+        }
+        monkeypatch.setattr(server_mod, "_client", lambda ctx: mock_client)
+        out = asyncio.run(server_mod.get_run_structure("demo", ctx=MagicMock()))
+        assert isinstance(out, str)
+        parsed = json.loads(out)
+        assert parsed["units"][0]["position"] == 10
+
+    def test_update_run_structure_uploads(self, monkeypatch):
+        structure = {"units": [{"type": "Survey", "position": 10, "survey_data": {
+            "name": "s", "items": [
+                {"type": "note", "name": "n1", "label": "Hi", "optional": 1}
+            ]}}]}
+        mock_client = AsyncMock()
+        mock_client.put_run_structure.return_value = None
+        mock_client.get_run_structure.return_value = structure
+        monkeypatch.setattr(server_mod, "_client", lambda ctx: mock_client)
+        out = asyncio.run(
+            server_mod.update_run_structure("demo", json.dumps(structure), ctx=MagicMock())
+        )
+        assert "successfully updated" in out
+        mock_client.put_run_structure.assert_awaited_once()
+
+    def test_update_run_structure_rejects_bad_json(self, monkeypatch):
+        monkeypatch.setattr(server_mod, "_client", lambda ctx: AsyncMock())
+        with pytest.raises(ValueError, match="not valid JSON"):
+            asyncio.run(server_mod.update_run_structure("demo", "{not json", ctx=MagicMock()))
+
+    def test_update_run_structure_requires_units(self, monkeypatch):
+        monkeypatch.setattr(server_mod, "_client", lambda ctx: AsyncMock())
+        with pytest.raises(ValueError, match="units"):
+            asyncio.run(server_mod.update_run_structure("demo", '{"foo": 1}', ctx=MagicMock()))
+
+    def test_update_run_structure_validation_error(self, monkeypatch):
+        bad = {"units": [{"type": "Survey", "position": 10,
+                          "survey_data": {"name": "s", "items": []},
+                          "condition": "x", "if_true": "not_int"}]}
+        monkeypatch.setattr(server_mod, "_client", lambda ctx: AsyncMock())
+        with pytest.raises(ValueError, match="validation failed"):
+            asyncio.run(server_mod.update_run_structure("demo", json.dumps(bad), ctx=MagicMock()))

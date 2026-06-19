@@ -1,10 +1,29 @@
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 from urllib.parse import urljoin, quote
 
 import httpx
+
+
+def _resolve_timeout() -> httpx.Timeout:
+    """Per-request timeout for formr API calls.
+
+    httpx defaults to 5s on every phase, which is too tight for slower or
+    remote instances: run creation, structure upload, and results export do
+    real synchronous server work (DB writes, markdown parsing, OpenCPU
+    renders) that a browser waits out but a 5s client aborts with a timeout.
+    Default to a generous read/write budget, keep connect short so a dead
+    host still fails fast, and let operators tune it via FORMR_HTTP_TIMEOUT
+    (seconds, applied to read/write/pool).
+    """
+    try:
+        seconds = float(os.getenv("FORMR_HTTP_TIMEOUT", "60"))
+    except ValueError:
+        seconds = 60.0
+    return httpx.Timeout(seconds, connect=min(10.0, seconds))
 
 from formr_mcp.utils import validate_run_name
 from .auth import AuthError, OAuthToken, get_token
@@ -32,7 +51,7 @@ class FormrClient:
         self.base_url = base_url.rstrip("/") + "/"
         self.client_id = client_id
         self.client_secret = client_secret
-        self._http = http_client or httpx.AsyncClient()
+        self._http = http_client or httpx.AsyncClient(timeout=_resolve_timeout())
         self._token: OAuthToken | None = None
         self._owns_http = http_client is None
         self._capabilities: dict | None = None
@@ -70,7 +89,19 @@ class FormrClient:
         headers = kwargs.pop("headers", {})
         headers["Authorization"] = f"Bearer {token}"
 
-        resp = await self._http.request(method, url, headers=headers, **kwargs)
+        try:
+            resp = await self._http.request(method, url, headers=headers, **kwargs)
+        except httpx.TimeoutException as e:
+            read_to = getattr(self._http.timeout, "read", None)
+            raise FormrClientError(
+                f"{method} {path} timed out (client limit ~{read_to}s). The formr server "
+                "accepted the connection but did not respond in time. If reads (e.g. get_run) "
+                "are instant but this WRITE hangs, the instance is stalling on the write itself "
+                "— most often a database lock (a running backup / FLUSH TABLES WITH READ LOCK, "
+                "or a long-running transaction blocking writes while reads pass), less often a "
+                "slow OpenCPU render — not the MCP or your token. Raise FORMR_HTTP_TIMEOUT to "
+                "wait longer, and check the instance's DB locks (SHOW PROCESSLIST) and logs."
+            ) from e
 
         if resp.status_code == 401 and not retried:
             self._token = None

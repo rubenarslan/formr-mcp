@@ -123,6 +123,8 @@ Set `FORMR_BASE_URL`, `FORMR_CLIENT_ID`, and `FORMR_CLIENT_SECRET` in a `.env` f
 |---|---|
 | `get_run_structure_to_file` | Fetch full structure to `.formr/<name>.json` (backs up existing) |
 | `update_run_structure_from_file` | Validate and upload from `.formr/<name>.json` |
+| `get_run_structure` | Fetch full structure as **JSON text** (no file — for clients without filesystem access, e.g. Claude Desktop) |
+| `update_run_structure` | Validate and upload a structure passed as **JSON text** |
 | `update_run_settings` | Change run-level settings (title, visibility, etc.) |
 
 ### Inspection & Analysis
@@ -144,7 +146,8 @@ Set `FORMR_BASE_URL`, `FORMR_CLIENT_ID`, and `FORMR_CLIENT_SECRET` in a `.env` f
 
 ## Structure Editing Workflow
 
-Run structures can be large. Use the **file-based workflow** instead of passing JSON through tool arguments:
+Run structures can be large. **With filesystem access** (Claude Code, editors), prefer the
+**file-based workflow** instead of passing JSON through tool arguments:
 
 ```
 1. Fetch   get_run_structure_to_file("my-run")
@@ -159,6 +162,15 @@ Run structures can be large. Use the **file-based workflow** instead of passing 
 - If `.formr/my-run.json` already exists, the previous version is backed up to `.formr/my-run.json.bak`
 - On upload validation errors, fix the file and retry — restore from `.bak` if stuck
 - The `.formr/` directory is gitignored
+
+**Without filesystem access** (e.g. Claude Desktop with no filesystem connector), use the
+inline text tools instead — same validation, no files:
+
+```
+1. Fetch   get_run_structure("my-run")          → returns the structure as JSON text
+2. Edit    Modify the JSON inline
+3. Upload  update_run_structure("my-run", "<json text>")  → validates and uploads
+```
 
 ## Project Structure
 

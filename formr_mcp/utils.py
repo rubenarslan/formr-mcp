@@ -14,20 +14,24 @@ from pathlib import Path
 _env_workspace = os.environ.get("FORMR_WORKSPACE_DIR")
 WORKSPACE_DIR = Path(_env_workspace) if _env_workspace else Path(".formr")
 
-VALID_NAME = re.compile(r"^[a-z][a-z0-9-]{2,254}$")
+# Mirror formr's own rule exactly (RunResource.php: /^[a-zA-Z][a-zA-Z0-9-]{2,255}$/)
+# so the MCP is never stricter than the server — formr allows uppercase and up
+# to 256 chars. Reserved-name checks are left to formr (being more permissive
+# here just defers to its server-side validation).
+VALID_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{2,255}$")
 
 
 def validate_run_name(name: str) -> None:
     """Validate a run name. Raises ValueError if invalid.
 
-    Name must start with a letter, contain only a-z, 0-9, hyphens,
-    and be 3-255 characters long.
+    Name must start with a letter (a-z or A-Z), contain only letters, digits,
+    and hyphens, and be 3-256 characters long.
     """
     if not VALID_NAME.match(name):
         raise ValueError(
             f"Invalid run name '{name}'. "
-            f"Name must start with a letter, contain only a-z, 0-9, hyphens, "
-            f"and be 3-255 characters long."
+            f"Name must start with a letter (a-z or A-Z), contain only letters, "
+            f"digits, and hyphens, and be 3-256 characters long."
         )
 
 

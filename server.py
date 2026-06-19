@@ -37,7 +37,7 @@ from formr_mcp.utils import (
 )
 from formr_mcp.validation import get_unit_type_schemas, validate_structure
 
-RunName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{2,254}$", min_length=3, max_length=255)]
+RunName = Annotated[str, Field(pattern=r"^[a-zA-Z][a-zA-Z0-9-]{2,255}$", min_length=3, max_length=256)]
 
 BASE_URL = os.getenv("FORMR_BASE_URL", "")
 CLIENT_ID = os.getenv("FORMR_CLIENT_ID", "")
@@ -163,10 +163,15 @@ compositions of units (Surveys, Pages, Emails, Branches, etc.) where
 execution flows by position number. Branching uses R expressions in
 `condition` and jumps to the `if_true` position.
 
-WORKFLOW — Always use the file-based workflow for run structures:
-  1. Fetch:  get_run_structure_to_file(name) → .formr/<name>.json (backs up existing)
-  2. Edit:   Use Read/Edit tools on .formr/<name>.json
-  3. Upload: update_run_structure_from_file(name) → validates and uploads
+WORKFLOW — editing run structures, two paths:
+  With filesystem access (Claude Code / editors) — preferred, best for large runs:
+    1. get_run_structure_to_file(name) → .formr/<name>.json (backs up existing)
+    2. edit .formr/<name>.json with Read/Edit
+    3. update_run_structure_from_file(name) → validates and uploads
+  Without filesystem access (e.g. Claude Desktop) — inline JSON text:
+    1. get_run_structure(name) → returns the structure as JSON text
+    2. edit that JSON in your reply
+    3. update_run_structure(name, structure_json) → validates and uploads
 
 PATTERNS — For complex runs (condition/covariate balancing, waiting rooms, loading screens,
 live aggregate feedback, adaptive loops, personalized emails, external API/SMS calls, DRY R
@@ -222,7 +227,7 @@ async def list_runs(name: RunName | None = None, ctx: Context = None) -> list[di
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def create_run(name: RunName, ctx: Context = None) -> dict:
-    """Create a new run. Name must start with a letter, contain only a-z, 0-9, hyphens, and be 3-255 chars.
+    """Create a new run. Name must start with a letter, contain only letters, digits, hyphens, and be 3-256 chars.
 
     Returns the created run name and link on success. Requires `run:write` OAuth scope.
     """
@@ -370,6 +375,52 @@ async def update_run_structure_from_file(name: RunName, ctx: Context = None) -> 
     if bak_path.exists():
         bak_path.unlink()
 
+    return f"Run '{name}': successfully updated ({units} units)."
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_run_structure(name: RunName, ctx: Context = None) -> str:
+    """Fetch a run's full structure and return it as JSON text (NOT written to a file).
+
+    Use this when you don't have filesystem access — e.g. Claude Desktop without a
+    filesystem connector. Edit the returned JSON inline, then push it back with
+    update_run_structure. For editor/CLI workflows with file access, prefer
+    get_run_structure_to_file + update_run_structure_from_file (better for large runs).
+    """
+    validate_run_name(name)
+    structure = await _client(ctx).get_run_structure(name)
+    return json.dumps(structure, indent=2, ensure_ascii=False)
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def update_run_structure(name: RunName, structure_json: str, ctx: Context = None) -> str:
+    """Validate a run structure passed as JSON text and upload it to formr.
+
+    Inline counterpart to get_run_structure for clients without filesystem access.
+    Pass the FULL structure as a JSON string — an object with a "units" array. It is
+    validated exactly like the file-based path; on failure you get the errors to fix
+    and retry (nothing is uploaded). For editor/CLI workflows, update_run_structure_from_file
+    is usually more convenient.
+    """
+    validate_run_name(name)
+    try:
+        structure = json.loads(structure_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"structure_json is not valid JSON: {e}")
+    if not isinstance(structure, dict) or "units" not in structure:
+        raise ValueError("Run structure must be a JSON object with a 'units' array.")
+
+    _normalize_survey_choices(structure)
+    errors = validate_structure(structure)
+    if errors:
+        raise ValueError(
+            "Structure validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
+        )
+
+    client = _client(ctx)
+    await client.put_run_structure(name, structure)
+    result = await client.get_run_structure(name)
+    units = len(result.get("units", []))
     return f"Run '{name}': successfully updated ({units} units)."
 
 
