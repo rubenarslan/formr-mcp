@@ -144,6 +144,30 @@ Set `FORMR_BASE_URL`, `FORMR_CLIENT_ID`, and `FORMR_CLIENT_SECRET` in a `.env` f
 | `get_unit_types` | Get all supported unit types and their required/optional fields |
 | `get_documentation_topics` | List available documentation topics |
 
+### Utilities
+
+| Tool | Description |
+|---|---|
+| `fetch_google_sheet` | Fetch a Google Sheet by its share/edit link as **CSV** (returned as text, or `to_file=True` to write `.formr/sheets/*.csv`) or **XLSX** (written to a file). Canonicalizes the link into the export URL for you. |
+
+## Importing from Google Sheets
+
+formr surveys are often authored in Google Sheets. A client like Claude Desktop
+can't turn a sheet's share link into the CSV/XLSX export URL on its own, so use
+`fetch_google_sheet`:
+
+```
+# read a tab as CSV text (default) — no filesystem connector needed
+fetch_google_sheet("https://docs.google.com/spreadsheets/d/<ID>/edit#gid=0")
+
+# write the workbook as XLSX (e.g. to upload via formr's survey import)
+fetch_google_sheet("<sheet link>", format="xlsx")
+```
+
+The sheet must be link-accessible (**Share → Anyone with the link → Viewer**) or
+published to the web; a private sheet returns a clear sharing error. The `gid` in
+the link selects the tab for CSV; XLSX always exports the whole workbook.
+
 ## Structure Editing Workflow
 
 Run structures can be large. **With filesystem access** (Claude Code, editors), prefer the

@@ -21,6 +21,7 @@ from formr_mcp.auth import AuthError, check_credentials
 from formr_mcp.client import FormrClient, FormrClientError, FormrPermissionError
 from formr_mcp import data_access as gate
 from formr_mcp import documentation as doc
+from formr_mcp import google_sheets as gsheets
 from formr_mcp import patterns as patterns_lib
 from formr_mcp.analysis import analyze_run as run_analysis
 from formr_mcp.editing import (
@@ -722,6 +723,35 @@ async def get_survey_structure(survey: str, ctx: Context = None) -> dict:
     inspect items/choices while designing or debugging a run. Scope: survey:read.
     """
     return await _client(ctx).get_survey(survey, "json")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+async def fetch_google_sheet(
+    url: str,
+    format: Literal["csv", "xlsx"] = "csv",
+    to_file: bool = False,
+    ctx: Context = None,
+) -> str:
+    """Fetch a Google Sheet by its share/edit link as CSV or XLSX.
+
+    Claude Desktop can't convert a Google Sheets link into the CSV/XLSX export
+    URL itself — this tool does that canonicalisation and fetches the data. Pass
+    any sheet link: .../spreadsheets/d/<ID>/edit#gid=<GID>, a sharing link, or a
+    published /d/e/... link. The gid (tab) is honored for CSV.
+
+    - format="csv" (default): returns the sheet as CSV TEXT inline, so a client
+      with no filesystem connector can read it. Set to_file=True to instead write
+      a .csv into the workspace (.formr/sheets/) and return its path.
+    - format="xlsx": the whole workbook is binary, so it is always written to a
+      file in the workspace and the path is returned (to_file is implied).
+
+    Requires the sheet to be link-accessible ('Anyone with the link -> Viewer')
+    or published to the web; a private sheet returns a clear sharing error.
+    Handy for importing survey item tables authored in Google Sheets — read the
+    CSV here to inspect/convert, or grab the XLSX to upload via formr's survey
+    import.
+    """
+    return await gsheets.fetch_google_sheet(url, format, to_file)
 
 
 if __name__ == "__main__":
