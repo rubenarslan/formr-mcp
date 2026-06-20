@@ -26,6 +26,9 @@ uv run server.py
 | `FORMR_BASE_URL` | formr instance URL (e.g. `http://localhost`) |
 | `FORMR_CLIENT_ID` | 32-char hex client ID from `/admin/account#api` |
 | `FORMR_CLIENT_SECRET` | 64-char hex secret from `/admin/account#api` |
+| `FORMR_DATA_ACCESS` | (optional) participant-data ceiling: `test_only` (default) or `all` |
+| `FORMR_HTTP_TIMEOUT` | (optional) HTTP timeout in seconds (default `60`) |
+| `FORMR_MCP_LOG_LEVEL` | (optional) log verbosity (default `INFO`; use `DEBUG` for raw httpx lines) |
 | `FLOWCHART_URL` | (optional) URL of the formr Flowchart Generator (default: `https://formr-flowchart-test.pages.dev`) |
 
 ## MCP Client Configuration
@@ -217,6 +220,24 @@ formr-mcp/
 ├── opencode.json.example      # opencode MCP config template
 └── pyproject.toml             # Project metadata and dependencies
 ```
+
+## Logs
+
+The server logs to **stderr** (stdout is the JSON-RPC channel and must stay
+clean). At the default `INFO` level it logs each tool call (name, arg preview,
+duration, success/error) and each formr API request (status + duration);
+`FORMR_MCP_LOG_LEVEL=DEBUG` additionally surfaces raw httpx lines.
+
+Where stderr ends up depends on the client:
+
+- **Claude Desktop** captures it per server:
+  `~/Library/Logs/Claude/mcp-server-<name>.log` (macOS),
+  `%APPDATA%\Claude\logs\mcp-server-<name>.log` (Windows). `<name>` is your
+  config key. `tail -f` it.
+- **Claude Code** — run `claude --debug` to see it inline; `/mcp` shows status.
+- **See it live / debug directly** — run the server yourself with the MCP
+  Inspector: `npx @modelcontextprotocol/inspector uv run server.py`, or run the
+  HTTP entrypoint: `MCP_BEARER_TOKEN=dev MCP_LOG_LEVEL=debug uv run http_server.py`.
 
 ## Testing
 

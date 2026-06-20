@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import webbrowser
 from contextlib import asynccontextmanager
@@ -22,6 +23,10 @@ from formr_mcp.client import FormrClient, FormrClientError, FormrPermissionError
 from formr_mcp import data_access as gate
 from formr_mcp import documentation as doc
 from formr_mcp import google_sheets as gsheets
+from formr_mcp import logsetup
+
+logsetup.setup_logging()
+log = logging.getLogger("formr_mcp.server")
 from formr_mcp import patterns as patterns_lib
 from formr_mcp.analysis import analyze_run as run_analysis
 from formr_mcp.editing import (
@@ -115,14 +120,11 @@ def _build_capability_report(caps: dict, token_scopes: list[str]) -> dict:
 async def lifespan(server: FastMCP) -> AsyncIterator[FormrClient]:
     err = check_credentials(BASE_URL, CLIENT_ID, CLIENT_SECRET)
     if err:
-        print("=" * 72)
-        print("  formr-mcp: AUTHENTICATION NOT CONFIGURED")
-        print("=" * 72)
-        print()
-        print(err)
-        print()
-        print("MCP tools will fail with auth errors until this is resolved.")
-        print("=" * 72)
+        # Logged to stderr (not print -> stdout, which would corrupt the
+        # stdio JSON-RPC channel). Collapse the multi-line guidance to keep
+        # it on one record.
+        log.warning("AUTHENTICATION NOT CONFIGURED — %s", " ".join(err.split()))
+        log.warning("MCP tools will fail with auth errors until this is resolved.")
 
     client = FormrClient(BASE_URL, CLIENT_ID, CLIENT_SECRET)
     try:
@@ -188,6 +190,9 @@ R contexts (conditions, item values/showif, labels, page/email bodies, External 
 secrets and pass them explicitly. Never use formr_connect() / formr_raw_results().
 See get_documentation("data-access").""",
 )
+
+# Log every tool call (name, args, duration, success/error) to stderr.
+logsetup.install_tool_logging(mcp)
 
 
 def _client(ctx: Context) -> FormrClient:

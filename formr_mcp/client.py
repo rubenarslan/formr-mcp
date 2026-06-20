@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Any
 from urllib.parse import urljoin, quote
 
 import httpx
+
+log = logging.getLogger("formr_mcp.client")
 
 
 def _resolve_timeout() -> httpx.Timeout:
@@ -68,12 +71,14 @@ class FormrClient:
 
     async def _ensure_token(self) -> str:
         if self._token is None or self._token.is_expired:
+            log.info("auth: requesting OAuth token from %s", self.base_url)
             self._token = await get_token(
                 self.base_url,
                 self.client_id,
                 self.client_secret,
                 self._http,
             )
+            log.info("auth: token acquired (scopes: %s)", self._token.scope or "(none)")
         return self._token.access_token
 
     async def request(
@@ -89,10 +94,12 @@ class FormrClient:
         headers = kwargs.pop("headers", {})
         headers["Authorization"] = f"Bearer {token}"
 
+        t0 = time.perf_counter()
         try:
             resp = await self._http.request(method, url, headers=headers, **kwargs)
         except httpx.TimeoutException as e:
             read_to = getattr(self._http.timeout, "read", None)
+            log.warning("formr %s %s timed out after ~%ss", method, path, read_to)
             raise FormrClientError(
                 f"{method} {path} timed out (client limit ~{read_to}s). The formr server "
                 "accepted the connection but did not respond in time. If reads (e.g. get_run) "
@@ -102,6 +109,9 @@ class FormrClient:
                 "slow OpenCPU render — not the MCP or your token. Raise FORMR_HTTP_TIMEOUT to "
                 "wait longer, and check the instance's DB locks (SHOW PROCESSLIST) and logs."
             ) from e
+
+        log.info("formr %s %s -> %s (%.0fms)", method, path, resp.status_code,
+                 (time.perf_counter() - t0) * 1000)
 
         if resp.status_code == 401 and not retried:
             self._token = None
