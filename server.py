@@ -344,6 +344,37 @@ def _normalize_survey_choices(structure: dict) -> None:
                             item["choice_list"] = item_name
 
 
+def _unit_signature(structure: dict) -> list[tuple]:
+    """(position, type) per unit; Page is exported as Endpage, so compare them as one."""
+    sig = []
+    for u in structure.get("units", []) or []:
+        if isinstance(u, dict):
+            t = "Endpage" if u.get("type") == "Page" else u.get("type")
+            pos = u.get("position")
+            # formr accepts numeric strings; compare "10" and 10 as one position.
+            try:
+                pos = int(pos)
+            except (TypeError, ValueError):
+                pass
+            sig.append((pos, t))
+    return sorted(sig, key=lambda x: (not isinstance(x[0], int), x[0] if isinstance(x[0], int) else 0, str(x)))
+
+
+def _verify_upload(name: str, sent: dict, stored: dict) -> None:
+    """formr can answer 200 for an import it rolled back (the old structure
+    had the same unit count). Compare what was sent with what is stored."""
+    want, got = _unit_signature(sent), _unit_signature(stored)
+    if want != got:
+        missing = sorted(set(want) - set(got), key=str)
+        extra = sorted(set(got) - set(want), key=str)
+        raise ValueError(
+            f"Run '{name}': formr accepted the upload but the stored structure differs from what was sent. "
+            f"Missing (position, type): {missing or 'none'}; unexpected: {extra or 'none'}. "
+            f"The import was likely rejected or partially applied — check the unit types "
+            f"(get_unit_types) and fix, then upload again."
+        )
+
+
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def update_run_structure_from_file(name: RunName, ctx: Context = None) -> str:
     """Read a run structure from .formr/<name>.json, validate, and upload to formr.
@@ -376,6 +407,7 @@ async def update_run_structure_from_file(name: RunName, ctx: Context = None) -> 
 
     await client.put_run_structure(name, structure)
     result = await client.get_run_structure(name)
+    _verify_upload(name, structure, result)
     units = len(result.get("units", []))
 
     if bak_path.exists():
@@ -426,6 +458,7 @@ async def update_run_structure(name: RunName, structure_json: str, ctx: Context 
     client = _client(ctx)
     await client.put_run_structure(name, structure)
     result = await client.get_run_structure(name)
+    _verify_upload(name, structure, result)
     units = len(result.get("units", []))
     return f"Run '{name}': successfully updated ({units} units)."
 

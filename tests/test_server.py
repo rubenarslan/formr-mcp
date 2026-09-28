@@ -267,3 +267,18 @@ class TestInlineStructureTools:
         monkeypatch.setattr(server_mod, "_client", lambda ctx: AsyncMock())
         with pytest.raises(ValueError, match="validation failed"):
             asyncio.run(server_mod.update_run_structure("demo", json.dumps(bad), ctx=MagicMock()))
+
+class TestVerifyUpload:
+    """formr can answer 200 for an import it rolled back; the upload tools
+    compare what was sent with what is stored."""
+
+    def test_matching_structure_passes_with_page_endpage_and_string_positions(self):
+        sent = {"units": [{"type": "Survey", "position": "10"}, {"type": "Page", "position": 20}]}
+        stored = {"units": [{"type": "Endpage", "position": 20}, {"type": "Survey", "position": 10}]}
+        server_mod._verify_upload("r", sent, stored)
+
+    def test_rolled_back_import_is_reported(self):
+        sent = {"units": [{"type": "Survey", "position": 10}, {"type": "SkipForward", "position": 20}]}
+        stored = {"units": [{"type": "Survey", "position": 10}, {"type": "Pause", "position": 20}]}
+        with pytest.raises(ValueError, match=r"Missing \(position, type\): \[\(20, 'SkipForward'\)\]"):
+            server_mod._verify_upload("r", sent, stored)

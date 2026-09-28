@@ -1,11 +1,22 @@
+# Mirrors RunUnitFactory::SupportedUnits (+ 'Endpage', which the importer maps
+# to Page). formr's importer throws on anything else, so listing a type here
+# that it can't create turns a clear validation error into an opaque
+# "Import incomplete" from the server.
 KNOWN_TYPES = {
     "Survey", "Page", "Email",
-    "Branch", "SkipForward", "SkipBackward",
+    "SkipForward", "SkipBackward",
     "External", "Pause", "Wait",
-    "Shuffle", "PushMessage", "Privacy", "Endpage",
+    "Shuffle", "PushMessage", "Endpage",
 }
 
-BRANCH_TYPES = {"Branch", "SkipForward", "SkipBackward"}
+# Types that exist as PHP classes but are not importable, with what to use instead.
+UNSUPPORTED_TYPES = {
+    "Branch": "Branch is formr's internal base class, not an importable unit. "
+              "Use SkipForward (jump to if_true when condition is TRUE) or SkipBackward (loop back).",
+    "Privacy": "Privacy/ToS text is a run setting (update_run_settings: privacy, tos), not an importable unit.",
+}
+
+BRANCH_TYPES = {"SkipForward", "SkipBackward"}
 
 # Items that MUST define choices (mirrors PHP $hasChoices = true, no auto-generation)
 CHOICES_REQUIRED = {
@@ -67,11 +78,6 @@ UNIT_SCHEMAS: dict[str, dict[str, list[str] | str]] = {
         "optional": ["description", "special", "subject", "account_id", "recipient_field", "body", "cron_only"],
         "description": "Sends an email to the participant.",
     },
-    "Branch": {
-        "required": ["type", "position", "condition", "if_true"],
-        "optional": ["description", "special", "automatically_jump", "automatically_go_on"],
-        "description": "Branching unit: if condition is true, jump to if_true position.",
-    },
     "SkipForward": {
         "required": ["type", "position", "condition", "if_true"],
         "optional": ["description", "special", "automatically_jump", "automatically_go_on"],
@@ -106,11 +112,6 @@ UNIT_SCHEMAS: dict[str, dict[str, list[str] | str]] = {
         "required": ["type", "position"],
         "optional": ["description", "special", "message", "topic", "priority", "time_to_live", "badge_count", "vibrate", "require_interaction", "renotify", "silent"],
         "description": "Sends a push notification.",
-    },
-    "Privacy": {
-        "required": ["type", "position"],
-        "optional": ["description", "special", "privacy_label", "tos_label"],
-        "description": "Privacy consent and terms of service checkboxes.",
     },
     "Endpage": {
         "required": ["type", "position"],
@@ -181,6 +182,18 @@ def validate_survey_data(survey_data: object, unit_label: str) -> list[str]:
             errors.append(
                 f"{unit_label}: item '{item_name or j}': 'choices' must be an object or array"
             )
+        elif choices:
+            # formr parses each choice label as a string (knitting_needed ->
+            # mb_strpos); an object such as {"label": ..., "label_parsed": null}
+            # crashes the whole import with a TypeError.
+            values = choices.items() if isinstance(choices, dict) else enumerate(choices)
+            for key, label in values:
+                # Null passes, as in the server's preflight; booleans are refused too.
+                if label is not None and (not isinstance(label, (str, int, float)) or isinstance(label, bool)):
+                    errors.append(
+                        f"{unit_label}: item '{item_name or j}': choice '{key}' must be a plain "
+                        f"label string, got {type(label).__name__} (label_parsed is not supported inside choices)"
+                    )
 
         if item_type in CHOICES_REQUIRED and not has_choices:
             errors.append(
@@ -242,6 +255,10 @@ def validate_structure(data: dict) -> list[str]:
         unit_type = unit.get("type")
         if not isinstance(unit_type, str) or not unit_type:
             errors.append(f"Unit at index {i} is missing 'type'")
+            continue
+
+        if unit_type in UNSUPPORTED_TYPES:
+            errors.append(f"Unit '{unit_type}' at index {i}: {UNSUPPORTED_TYPES[unit_type]}")
             continue
 
         if unit_type not in KNOWN_TYPES:
@@ -311,7 +328,7 @@ def validate_structure(data: dict) -> list[str]:
             errors.append(
                 f"The run starts with a '{first_type}' at position {first_pos} — "
                 f"Page and Endpage units must follow a content unit (e.g. Survey), "
-                f"not lead the run. Use a Survey or Privacy unit as the entry point."
+                f"not lead the run. Use a Survey unit as the entry point."
             )
 
     return errors

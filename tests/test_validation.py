@@ -77,3 +77,38 @@ class TestSurveyDataSettings:
         errors = validate_structure({"units": [unit]})
         paging_errors = [e for e in errors if "use_paging" in e]
         assert len(paging_errors) == 1
+
+class TestImportableTypes:
+    """formr's importer only creates RunUnitFactory::SupportedUnits; anything
+    else used to fail server-side with an opaque unit-count mismatch."""
+
+    @pytest.mark.parametrize("utype,hint", [("Branch", "SkipForward"), ("Privacy", "run setting")])
+    def test_unimportable_type_is_refused_with_a_hint(self, utype, hint):
+        units = [
+            {"type": "Survey", "position": 10, "survey_data": {"name": "s", "items": [{"type": "note", "name": "n", "label": "x"}]}},
+            {"type": utype, "position": 20, "condition": "TRUE", "if_true": 10},
+        ]
+        errors = validate_structure({"units": units})
+        assert len(errors) == 1
+        assert f"'{utype}' at index 1" in errors[0] and hint in errors[0]
+
+    def test_unit_type_schemas_do_not_offer_branch_or_privacy(self):
+        from formr_mcp.validation import get_unit_type_schemas
+        schemas = get_unit_type_schemas()
+        assert "Branch" not in schemas and "Privacy" not in schemas
+
+
+class TestChoiceLabels:
+    def _survey(self, choices):
+        return {"units": [{"type": "Survey", "position": 10, "survey_data": {"name": "s", "items": [
+            {"type": "mc", "name": "q1", "label": "Pick", "choices": choices},
+        ]}}]}
+
+    def test_object_shaped_choice_is_refused(self):
+        errors = validate_structure(self._survey({"1": {"label": "a", "label_parsed": None}, "2": "b"}))
+        assert any("choice '1' must be a plain label string" in e for e in errors)
+        assert not any("choice '2'" in e for e in errors)
+
+    @pytest.mark.parametrize("choices", [{"1": "yes", "2": "no"}, {"1": 1, "2": 2.5}, ["a", "b"], {"1": "a", "2": None}])
+    def test_plain_labels_and_null_pass(self, choices):
+        assert not any("plain label" in e for e in validate_structure(self._survey(choices)))

@@ -91,7 +91,7 @@ When authoring items as JSON (via `survey_data`), these differences apply:
 | Choices sheet | Separate "choices" sheet | Not needed — inline `choices` or `choice_list` reference |
 | Item order | `order` column (auto-assigned) | `item_order` field (int, 1-indexed) |
 | `class` | Column in spreadsheet | Same field, same CSS values |
-| `label_parsed` | Not applicable (no equivalent) | Set equal to `label`, or `null` |
+| `label_parsed` | Not applicable (no equivalent) | Omit it — formr renders it from `label` (`null` is also accepted) |
 
 ## Common fields (every item type)
 
@@ -109,7 +109,7 @@ When authoring items as JSON (via `survey_data`), these differences apply:
 | `type_options` | No | Type-specific options (min, max, step, auto, maxlength, etc.). |
 | `item_order` | No | Integer display order (1-indexed). |
 | `block_order` | No | Block ordering field for randomization. |
-| `label_parsed` | No | HTML-parsed label. Set equal to `label` or `null`. |
+| `label_parsed` | No | HTML-parsed label. Omit it; formr computes it from `label`. Never put it inside `choices`. |
 
 ## Display / Layout
 
@@ -279,8 +279,9 @@ The participant moves from one position to the next unless a branch redirects th
 > will always show `type='Endpage'`. Use `Endpage` in your run structures — it's the
 > canonical name. `Page` is accepted as an alias.
 
-- **Branches redirect** — `Branch`, `SkipForward`, and `SkipBackward` use an R `condition` expression.
-  If `TRUE`, the participant jumps to the `if_true` position.
+- **Branches redirect** — `SkipForward` and `SkipBackward` use an R `condition` expression.
+  If `TRUE`, the participant jumps to the `if_true` position. There is no `Branch` unit type:
+  formr's importer rejects it — use `SkipForward` for a forward branch.
 - **Surveys collect data** — a `Survey` unit links to a survey definition (either existing `study_id` or inline `survey_data`).
 - **Emails are sent automatically** — `Email` units fire when reached (or on cron for `cron_only=1`).
 - **Pauses wait** — `Pause` units stall progress until a time, date, or duration passes. No user interaction; the page displays the `body` content.
@@ -838,7 +839,7 @@ Each item in `items` is a JSON object with these fields:
 | `choices` | No | object or array/null | Inline choices (see below). |
 | `block_order` | No | string | Block ordering field for randomization. |
 | `item_order` | No | int | Display order (1-indexed, sequential). |
-| `label_parsed` | No | string/null | HTML-parsed version of label. Set equal to `label` when creating; can be `null`. |
+| `label_parsed` | No | string/null | HTML-parsed version of label. Omit it — formr computes it (`null` is accepted). |
 
 ## Choices
 
@@ -858,7 +859,11 @@ Choices can be specified in two formats:
 }
 ```
 
-**Array format** (legacy, values = labels):
+Each choice value must be a plain label string — not an object like
+`{"label": ..., "label_parsed": ...}`, which fails the whole import.
+
+**Array format** (legacy, values = labels; the stored codes are **0-based**,
+so `["nein", "ja"]` saves 0/1 — use the object format for 1-based codes):
 ```json
 {
     "type": "mc",
@@ -1061,7 +1066,7 @@ Use the `class` field for layout control (same as spreadsheet):
 2. No `choice1..choice12` columns — use `choices` object instead
 3. `type_options` is a separate field, not appended to the type string
 4. `optional` is `0`/`1` integer, not `*`/`!`
-5. `label_parsed` should mirror `label` or be `null`
+5. `label_parsed` can be omitted — formr computes it from `label`
 6. Items use `item_order` (int) instead of spreadsheet row `order`
 7. No separate Google Sheets import — JSON is uploaded as part of the run structure
 """
@@ -1863,7 +1868,7 @@ and optional `settings{}`.
 
 **Items as JSON objects**: Each item has fields: `type`, `name`, `label`,
 `optional` (0/1), `class`, `showif`, `value`, `choice_list`, `type_options`,
-`choices`, `block_order`, `item_order`. Set `label_parsed` equal to `label`.
+`choices`, `block_order`, `item_order`. Omit `label_parsed`; formr computes it.
 
 **Inline choices**: Use the `choices` field instead of a separate choices
 sheet. Object format gives explicit key-value pairs; array format uses
