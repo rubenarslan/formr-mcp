@@ -1,0 +1,12 @@
+.venv
+.git
+.gitignore
+.env
+.env.*
+.formr
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.DS_Store
+opencode.json
