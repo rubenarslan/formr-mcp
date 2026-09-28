@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 from formr_mcp.utils import safe_run_filepath, validate_run_name
+from formr_mcp.validation import SURVEY_UNIT_TYPES
 
 
 def _strip_html(text: str) -> str:
@@ -85,13 +86,13 @@ def summarize_run_structure(
         pos = unit.get("position", "?")
         desc = unit.get("description", "")
 
-        if utype == "Survey":
+        if utype in SURVEY_UNIT_TYPES:
             sd = unit.get("survey_data") or {}
             sname = sd.get("name", "(unnamed)")
             items = sd.get("items") or []
             n_items = len(items) if isinstance(items, list) else 0
 
-            lines.append(f'### Position {pos}: Survey "{sname}" ({n_items} items)')
+            lines.append(f'### Position {pos}: {utype} "{sname}" ({n_items} items)')
             if desc:
                 lines.append(f"  Description: {desc}")
 
@@ -194,7 +195,7 @@ def find_items(
     total = 0
 
     for unit in units:
-        if unit.get("type") != "Survey":
+        if unit.get("type") not in SURVEY_UNIT_TYPES:
             continue
         sd = unit.get("survey_data")
         if not isinstance(sd, dict):

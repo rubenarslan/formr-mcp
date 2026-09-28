@@ -5,7 +5,15 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from formr_mcp.validation import validate_survey_data, validate_structure
+from formr_mcp.validation import (
+    FORM_V2_ONLY_ITEM_TYPES,
+    KNOWN_ITEM_TYPES,
+    KNOWN_TYPES,
+    SURVEY_UNIT_TYPES,
+    get_unit_type_schemas,
+    validate_structure,
+    validate_survey_data,
+)
 
 
 class TestSurveyDataSettings:
@@ -112,3 +120,88 @@ class TestChoiceLabels:
     @pytest.mark.parametrize("choices", [{"1": "yes", "2": "no"}, {"1": 1, "2": 2.5}, ["a", "b"], {"1": "a", "2": None}])
     def test_plain_labels_and_null_pass(self, choices):
         assert not any("plain label" in e for e in validate_structure(self._survey(choices)))
+
+
+class TestFormV2ItemTypes:
+    """Item types added on the form_v2 branch (application/Model/Item/*.php)."""
+
+    def _survey_unit(self, items, unit_type="Survey"):
+        return {
+            "type": unit_type,
+            "position": 10,
+            "description": "demo",
+            "survey_data": {"name": "demo", "items": items},
+        }
+
+    @pytest.mark.parametrize("item_type", ["rank", "visual_analog_scale", "bot_check", "time"])
+    def test_new_item_types_are_known(self, item_type):
+        assert item_type in KNOWN_ITEM_TYPES
+
+    def test_rank_accepted_with_choices(self):
+        items = [{"type": "rank", "name": "prefs", "label": "Rank these",
+                  "choices": {"1": "A", "2": "B", "3": "C"}}]
+        errors = validate_structure({"units": [self._survey_unit(items)]})
+        assert errors == []
+
+    def test_rank_without_choices_rejected(self):
+        items = [{"type": "rank", "name": "prefs", "label": "Rank these"}]
+        errors = validate_structure({"units": [self._survey_unit(items)]})
+        assert any("prefs" in e and "choices" in e for e in errors)
+
+    def test_visual_analog_scale_requires_choices(self):
+        ok = [{"type": "visual_analog_scale", "name": "vas", "label": "How much?",
+               "choices": {"1": "not at all", "2": "very much"}}]
+        assert validate_structure({"units": [self._survey_unit(ok)]}) == []
+        bad = [{"type": "visual_analog_scale", "name": "vas", "label": "How much?"}]
+        assert any("vas" in e for e in validate_structure({"units": [self._survey_unit(bad)]}))
+
+    def test_bot_check_choices_are_optional_not_forbidden(self):
+        """BotCheck_Item blanks its choices before parent::validate(), so
+        choice1..3 are accepted as widget copy — and omitting them is fine too."""
+        without = [{"type": "bot_check", "name": "human", "label": "Quick check"}]
+        assert validate_structure({"units": [self._survey_unit(without)]}) == []
+        with_copy = [{"type": "bot_check", "name": "human", "label": "Quick check",
+                      "choices": {"1": "I am human", "2": "Confirmed", "3": "Checking…"}}]
+        assert validate_structure({"units": [self._survey_unit(with_copy)]}) == []
+
+    def test_datetime_local_both_spellings_known(self):
+        for t in ("datetime-local", "datetime_local"):
+            items = [{"type": t, "name": "when", "label": "When?"}]
+            assert validate_structure({"units": [self._survey_unit(items)]}) == []
+
+    def test_form_v2_only_set(self):
+        assert FORM_V2_ONLY_ITEM_TYPES == {"rank", "bot_check"}
+        assert FORM_V2_ONLY_ITEM_TYPES <= KNOWN_ITEM_TYPES
+
+    def test_unknown_item_type_still_rejected(self):
+        items = [{"type": "definitely_not_an_item", "name": "x", "label": "x"}]
+        errors = validate_structure({"units": [self._survey_unit(items)]})
+        assert any("unknown item type" in e for e in errors)
+
+
+class TestFormUnit:
+    def test_form_is_a_known_unit_type(self):
+        assert "Form" in KNOWN_TYPES
+        assert SURVEY_UNIT_TYPES == {"Survey", "Form"}
+
+    def test_form_unit_accepted(self):
+        errors = validate_structure({"units": [
+            {"type": "Form", "position": 10, "description": "diary", "study_id": 291},
+            {"type": "Endpage", "position": 20, "body": "done"},
+        ]})
+        assert errors == []
+
+    def test_form_schema_documents_study_id(self):
+        schemas = get_unit_type_schemas()
+        assert "Form" in schemas
+        assert "study_id" in schemas["Form"]["optional"]
+        assert "rendering_mode" in schemas["Form"]["description"]
+
+    def test_form_survey_data_is_validated_like_survey(self):
+        errors = validate_structure({"units": [{
+            "type": "Form", "position": 10,
+            "survey_data": {"name": "demo", "items": [
+                {"type": "mc", "name": "m1", "label": "pick"},  # missing choices
+            ]},
+        }]})
+        assert any("Form unit at position 10" in e for e in errors)

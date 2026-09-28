@@ -143,7 +143,7 @@ Set `FORMR_BASE_URL`, `FORMR_CLIENT_ID`, and `FORMR_CLIENT_SECRET` in a `.env` f
 
 | Tool | Description |
 |---|---|
-| `get_documentation` | Learn formr design (topics: `item-types`, `run-concepts`, `r-code`, `survey-json`, `examples`, `best-practices`) |
+| `get_documentation` | Learn formr design (topics: `item-types`, `run-concepts`, `r-code`, `survey-json`, `examples`, `best-practices`, `form-v2`) |
 | `get_unit_types` | Get all supported unit types and their required/optional fields |
 | `get_documentation_topics` | List available documentation topics |
 

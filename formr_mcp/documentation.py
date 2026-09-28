@@ -67,7 +67,7 @@ def get_documentation(topic: str, section: str | None = None) -> str:
 
 # ── Item types ──────────────────────────────────────────────────────
 
-@_topic("item-types", "All 56 survey item types with fields")
+@_topic("item-types", "All 59 survey item types with fields")
 def _item_types():
     return r"""# Survey Item Types
 
@@ -77,7 +77,12 @@ each item is a JSON object in the `items` array.
 **Choices quick reference:**
 - **Required** — items that show a list of options (radio, dropdown, checkbox group, slider, weekday picker, heading)
 - **Forbidden** — items that collect free-form input, binary checkboxes, dates, files, or computed values
-- **Optional** — `select_or_add_multiple` (can work with inline choices or without), `sex` (auto-set to Male/Female if absent)
+- **Optional** — `select_or_add_multiple` (can work with inline choices or without), `sex` (auto-set to Male/Female if absent), `bot_check` (choices are optional widget copy)
+
+**form_v2-only types:** `rank` and `bot_check` need the `form` webpack bundle,
+which only the form_v2 engine loads. Put them in a study rendered by a `Form`
+unit (`rendering_mode='v2'`). In a legacy `Survey` unit they degrade to bare
+hidden inputs. See `get_documentation("form-v2")`.
 
 ## JSON vs Spreadsheet
 
@@ -161,6 +166,7 @@ All accept `min,max` in type_options (e.g. `2013-01-01,2014-01-01`, `-2years,now
 | `check` | TINYINT UNSIGNED | Single checkbox | Forbidden | Yes/no (0 or 1). Does NOT use choices. |
 | `check_button` | TINYINT UNSIGNED | Single toggle button | Forbidden | Like `check` but large toggle. |
 | `choose_two_weekdays` | VARCHAR(40) | Special checkboxes | **Required** | Select exactly two weekdays. Must provide 5 choices (Mon–Fri). |
+| `rank` | VARCHAR(255) | Drag-and-drop list | **Required** | **form_v2 only.** Qualtrics-style rank order. Stores the choice *keys* in final order joined by `", "` (first = rank 1), e.g. `"3, 1, 2"` — recover in R with `strsplit(rank_item, ", ")`. `type_options` keywords: `random` (alias `shuffle`) starts from a shuffled order; `touch` (alias `require_change`) only counts the item as answered once the participant has actually reordered it. Reorderable by mouse, touch, the per-row ▲/▼ buttons, or keyboard (Arrow Up/Down, Home/End). |
 
 ## Dropdown / Select
 
@@ -179,6 +185,7 @@ All accept `min,max` in type_options (e.g. `2013-01-01,2014-01-01`, `-2years,now
 | `range` | INT UNSIGNED | **Required** | `min,max,step` (0,100,1) | Slider. `choice1` = left label, `choice2` = right label. Value hidden. |
 | `range_ticks` | INT UNSIGNED | **Required** | `min,max,step` (0,100,1) | Slider with tick marks + tooltip. |
 | `rating_button` | SMALLINT | **Required** | `min,max,step` (1,5,1) | Numbered buttons. `choice1` = left label, `choice2` = right label. Choices auto-generated from range. |
+| `visual_analog_scale` | INT UNSIGNED | **Required** | `min,max,step` (0,100,1) | Slider with **no default**: the thumb is hidden and the item submits empty until the participant drags it, so a required VAS really catches "never engaged". Authored exactly like `range` (`choice1` = left pole, `choice2` = right pole). Renders in both v1 and v2. |
 | `sex` | TINYINT UNSIGNED | Optional | — | Male/female buttons. 1 = male, 2 = female. Choices auto-set if absent. |
 
 ## Hidden / Automatic (no user input)
@@ -224,6 +231,28 @@ Choices: **Forbidden**.
 | `add_to_home_screen` | VARCHAR(20) | **Required** | Button to add PWA to home screen. |
 | `push_notification` | TEXT | **Required** | Button to request push permission. Stores subscription JSON. |
 | `request_cookie` | VARCHAR(20) | **Required** | Button for functional cookie consent. |
+
+## Bot check (form_v2)
+
+| Type | MySQL | Choices | type_options | Description |
+|------|-------|---------|--------------|-------------|
+| `bot_check` | VARCHAR(20) | Optional | difficulty `1`..`3` | **form_v2 only.** "Are you human" gate. Self-hosted Altcha proof-of-work (Argon2id), minted and verified on the formr server — no third-party captcha, no external request, no PII. |
+
+Leave it **required** (the default) so a missing/failed token blocks the page
+submit. The three choices are optional widget copy, not answer options — use
+them to repurpose the item as an "I'm answering this myself" affirmation gate:
+
+| Choice | Default | Purpose |
+|--------|---------|---------|
+| `choice1` | "Verify you are human" | the clickable affirmation inside the box |
+| `choice2` | "Verified" | text shown after a successful check |
+| `choice3` | "Verifying…" | in-progress text |
+
+```json
+{"name": "human", "type": "bot_check", "label": "Quick check",
+ "choices": {"1": "I am completing this survey myself, without automation.",
+             "2": "Thank you — confirmed.", "3": "Checking…"}}
+```
 
 ## Type Options (spreadsheet → JSON mapping)
 
@@ -283,6 +312,7 @@ The participant moves from one position to the next unless a branch redirects th
   If `TRUE`, the participant jumps to the `if_true` position. There is no `Branch` unit type:
   formr's importer rejects it — use `SkipForward` for a forward branch.
 - **Surveys collect data** — a `Survey` unit links to a survey definition (either existing `study_id` or inline `survey_data`).
+- **Forms are surveys on the new engine** — a `Form` unit renders the same survey definition through form_v2: one AJAX single-page document, client-side `showif`, an offline queue. It links to its study through `study_id` and stamps `rendering_mode='v2'` on it. See `get_documentation("form-v2")` before using one — the export/import round-trip has a sharp edge.
 - **Emails are sent automatically** — `Email` units fire when reached (or on cron for `cron_only=1`).
 - **Pauses wait** — `Pause` units stall progress until a time, date, or duration passes. No user interaction; the page displays the `body` content.
 - **Waits are interactive pauses** — `Wait` units also stall progress, but participants can click through to advance early. The `body` field stores the **position number** to jump to on click.
@@ -1713,6 +1743,7 @@ Common kwargs by unit type:
 - **Pause/Wait**: `wait_minutes`, `wait_until_time` ("HH:MM:SS"), `wait_until_date` ("YYYY-MM-DD"), `relative_to` (R expr), `body`
 - **Wait**: `body` is an integer position for click-through (NOT display content)
 - **Survey**: `study_id` (int) or `survey_data` (dict with name, items, settings)
+- **Form**: `study_id` (int) — the form_v2 renderer for an existing study. Creating the unit sets that study's `rendering_mode='v2'`. See `get_documentation("form-v2")`; the export does **not** round-trip the study link, so re-uploading a fetched structure re-sends `study_id` only if you keep it in the file yourself.
 - **Endpage/Page**: `body` (markdown/knitr content)
 - **External**: `address` (URL or R code), `api_end` (0/1)
 
@@ -2572,4 +2603,256 @@ httr::GET("https://gate.example.com/send", query = list(
 **Not for the formr v1 API secret.** Cross-participant data access uses
 `formr_api_authenticate()` with no arguments — formr auto-injects a run-scoped token. Don't
 store the API secret here. See `data-access`.
+"""
+
+
+# ── form_v2 ─────────────────────────────────────────────────────────
+
+@_topic("form-v2", "The Form unit and the form_v2 engine — showif rules, offline, layouts")
+def _form_v2():
+    return r"""# form_v2: the `Form` unit and the v2 rendering engine
+
+formr has two survey engines. Which one a participant gets is a property of the
+**study**, not of the run:
+
+| | legacy | form_v2 |
+|---|---|---|
+| Run unit type | `Survey` | `Form` |
+| Study flag | `rendering_mode='v1'` (default) | `rendering_mode='v2'` |
+| Delivery | one HTTP round-trip per page | whole study rendered into one document, pages switched client-side |
+| `showif` | R, evaluated server-side via OpenCPU | **JavaScript, evaluated in the browser** |
+| Offline | none | IndexedDB queue + optional Background Sync |
+
+Everything else is the same: same spreadsheet/JSON format, same item types,
+same `survey_items` / results tables, same run flow.
+
+## The `Form` unit
+
+`Form` is a real run unit type (PHP `RunUnit\Form extends RunUnit\Survey`), and
+it identifies its study **differently from `Survey`**:
+
+- A `Survey` unit *shares its primary key* with the `survey_studies` row —
+  `survey_run_units.unit_id` is the study id.
+- A `Form` unit keeps **its own** `survey_units` row (`type='Form'`) and points
+  at the study through **`survey_units.form_study_id`**.
+  `survey_run_units.unit_id` stays pointed at the Form's own row.
+
+Creating a Form unit with a `study_id` also stamps `rendering_mode='v2'` on that
+study.
+
+### Creating one
+
+`add_run_unit(name, "Form", position, unit_fields={"study_id": <id>})`, then
+`update_run_structure_from_file`. The API accepts it — `Form` is in the PHP
+`RunUnit::SupportedUnits` list, and the structure-import path passes `study_id`
+straight through to `Form::create`.
+
+```json
+{
+    "type": "Form",
+    "position": 10,
+    "description": "Daily diary",
+    "study_id": 291
+}
+```
+
+Inline `survey_data` is **not** a reliable way to create a Form: the study it
+creates goes through the plain `Survey` path and comes back `rendering_mode='v1'`,
+leaving you a v2 unit pointing at a v1 study. Create/upload the survey first
+(admin UI or `/admin/survey`), then reference it by `study_id`.
+
+## ⚠️ The export does not round-trip a Form's study link
+
+`get_run_structure_to_file` returns a Form unit as **only**
+`{type, description, position, special}` — no `study_id`, no `survey_data`.
+(`Run::export` attaches `survey_data` only when `type === 'Survey'`, and
+`study_id` is not in the unit's export attributes.)
+
+`update_run_structure_from_file` **replaces every unit in the run**. So a plain
+fetch → edit-something-else → upload silently rebuilds the Form unit with no
+study attached, and participants hit an empty unit.
+
+**Rule: after fetching a structure that contains a `Form` unit, re-add its
+`"study_id"` in the local `.formr/<run>.json` before uploading.** Note the study
+ids somewhere first — the export won't remind you. Same caution applies to
+`duplicate_run_units` on a Form.
+
+## Per-study v2 settings
+
+These live on the study (`survey_studies`), not on the unit:
+
+| Column | Values | Meaning |
+|--------|--------|---------|
+| `rendering_mode` | `v1` \| `v2` | which engine renders the study |
+| `offline_mode` | `1` (default) \| `0` | queue failed submits in IndexedDB |
+| `allow_previous` | `0` (default) \| `1` | show a Previous button on non-first pages |
+| `layout` | `default` \| `solo` | scrolling page vs. one-item-per-screen |
+| `language` | BCP 47, default `en` | engine-chrome strings (**`en` and `de` only**) |
+
+**They are read-only over the API.** The structure export shows them under
+`survey_data.settings`, but formr's import allowlist
+(`SurveyStudy::createFromData`) does not include them — uploading a changed
+value is silently ignored. Change them in the admin UI
+(`/admin/survey/<name>` → "Form_v2 settings"), or by creating a `Form` unit
+(which sets `rendering_mode='v2'`).
+
+`language` only translates the engine's own chrome (nav buttons, save pill,
+offline banners, validation fallbacks). Item labels and choices are whatever the
+sheet says. Only `en` and `de` ship; a region tag falls back to its base
+language (`de-AT` → `de`) and any missing key falls back to English.
+
+`layout='solo'` renders one item per screen with an explicit forward/back step
+controller — a mobile/app-style presentation. `default` is the ordinary
+scrolling page.
+
+## `showif` in v2 is JavaScript — and only JavaScript
+
+This is the one change that breaks v1 sheets. In a v2 study a `showif` is a
+**JS expression evaluated in the participant's browser**, reactive on every
+input change. There is one variable per item name, plus a small stdlib:
+
+| Helper | Meaning |
+|--------|---------|
+| `isNA(x)` | true for `null` / `undefined` / `""` / empty array / `NaN` |
+| `answered(x)` | `!isNA(x)` |
+| `contains(haystack, needle)` | substring or array-includes |
+| `containsWord(haystack, word)` | matches `\bword\b` |
+| `startsWith(s, p)` / `endsWith(s, p)` | string prefix / suffix |
+| `last(arr)` | last element (value as-is for non-arrays) |
+
+A regex transpiler rewrites the common R-isms first, so most v1 showifs keep
+working unchanged: `==` `!=` `>` `<=`, `&&` `||`, the formr infix ops
+(`%contains%`, `%begins_with%`, `%ends_with%`, `%starts_with%`,
+`%contains_word%`), `is.na()`, `tail(x, 1)`, `current(x)`,
+`stringr::str_length()`.
+
+```
+showif: mc_polytheism == 2
+showif: trigger == "yes" && answered(plain)
+showif: !contains(animals, "cat")
+showif: last(daily_mood) > 5
+```
+
+**`r(...)` in a `showif` is invalid.** The renderer rejects it with a
+validation error shown to the admin and drops the expression. Anything the
+transpiler can't turn into JS (`ifelse`, `c(...)`, `%in%`, `<-`, `$` access,
+`paste`, `NA`) has to be rewritten in JS or bridged (below).
+
+**Undefined or erroring showifs keep the server's decision.** Every expression
+is evaluated inside a try/catch; on `undefined` the item's *current* visibility
+is preserved rather than forced visible. The server renders an unresolved-NA
+showif hidden by default (matching v1), so an item whose condition can't be
+evaluated yet stays hidden until an answer makes it true — it does not flash
+into view.
+
+### Bridging R into a showif
+
+Add a **hidden item whose `value` is `r(...)`** and reference that item's name
+from the JS showif:
+
+```
+name        type     showif             value
+my_score    hidden                      r(complex_score(current(q1)))
+followup    text     my_score > 0.5
+```
+
+The server resolves the hidden field, writes the scalar into its input, and the
+reactive layer makes it available to every showif that names it. One OpenCPU
+call per page regardless of how many showifs read it, and the resolved value is
+inspectable in the DOM when you are debugging.
+
+## `value` in v2: wrap server-side R in `r(...)`
+
+On the `value` column, **server-side R must be wrapped in `r(...)`** — bare R is
+invalid and surfaces a validation error. Literals and the v1 `sticky` keyword
+work exactly as before.
+
+```
+value: r(paste(answered_items, collapse=", "))
+value: r(ifelse(is.na(other), "", nchar(other)))
+value: sticky        # v1 keyword — tail(na.omit(survey$item), 1)
+value: 5             # numeric literal, not evaluated
+```
+
+The R source never reaches the browser. Each wrapped expression is recorded in
+`survey_r_calls` (slot `value`) at render time and the client only ever holds
+the numeric call id.
+
+**Resolution is page-scoped.** Only the page the participant is currently
+looking at gets its `r(...)` values and dynamic labels resolved: the first
+visible page at initial load, then one batched OpenCPU call per page transition
+(`/form-render-page`) against the latest answers. Later pages carry
+placeholders until you reach them — which is what makes "page N+1 depends on an
+answer from page N" work. Rate limit: 30 calls / 60 s per session.
+
+**Dynamic labels are all-or-nothing.** A label containing inline R Markdown
+(`` `r expr` ``) is allowlisted as one call for the *whole* label; partial
+chunks are not extracted.
+
+## Offline queue and Background Sync
+
+On by default (`offline_mode=1`). When a page submit fails — no network, a 5xx —
+the v2 client:
+
+1. persists the JSON payload to IndexedDB (db `formrQueue`, keyed by a
+   client-generated RFC 4122 UUID),
+2. shows a "queued, will send when you reconnect" banner,
+3. lets the participant continue to the next page locally,
+4. drains the queue against `/{run}/form-sync` on the `online` event, on the
+   next page load, or via a **Background Sync** wake-up.
+
+The server dedupes on the UUID, so replaying a queued submission is a no-op.
+Background Sync (drains even after the tab is closed) exists on Chromium and
+Android Chrome; **iOS Safari has no Background Sync** — there the page's own
+`online` event does the draining when the participant reopens the tab. File
+uploads ≤10 MB are queued with the blob; larger files error rather than fill the
+quota. Turn `offline_mode` off for studies whose answers must not persist on the
+participant's device.
+
+## `allow_previous`
+
+Off by default. When on, non-first pages get a Previous button that reveals
+already-rendered pages **from the in-memory document** — it does not refetch
+them from the server. If your design mutates per-page state server-side,
+back-navigation can show stale content. Leave it off unless the study tolerates
+that.
+
+## Item types that need v2
+
+- **`rank`** — drag-and-drop rank order (mouse, touch, per-row ▲/▼, or
+  keyboard). Stores choice keys in final order joined by `", "`.
+- **`bot_check`** — self-hosted Altcha proof-of-work "are you human" gate; no
+  third-party captcha and no PII.
+
+Both need the `form` webpack bundle, which only v2 loads; in a `Survey` unit
+they degrade to bare hidden inputs. **`visual_analog_scale`** (a `range` with no
+default) is new alongside form_v2 but renders in **both** engines. See
+`get_documentation("item-types")` for their fields.
+
+## Migrating an existing v1 study
+
+1. **Scan it first.** `php bin/form_v2_compat_scan.php <study_id|study_name>`
+   (or the "Run v2 compatibility scan" button on `/admin/survey/<name>`)
+   classifies every non-empty `showif` / `value` as empty, r-wrapped, JS-OK, or
+   needs-a-rewrite, prints suggested `r(...)` wrappings, and exits 2 if
+   anything is flagged — so it works as a CI gate. It is advisory and never
+   mutates the sheet.
+2. Rewrite flagged `showif`s in JS, or move the R into a hidden `value: r(...)`
+   field and reference that name.
+3. Decide `offline_mode`, `allow_previous`, `layout`, `language`.
+4. If the study uses `add_to_home_screen` / `push_notification`, configure the
+   run as an installable PWA and check `/{run}/manifest` responds.
+5. Swap the `Survey` unit for a `Form` unit pointing at the study (this sets
+   `rendering_mode='v2'`), then walk every page via the run's "use as yourself"
+   link.
+
+## Known limitations vs. v1
+
+- No `webshim` range tooltip — v2 renders a bare native slider with side
+  labels. `visual_analog_scale` is the v2-native answer for "rating with no
+  default".
+- Audio/video capture UX is not smoke-tested across browsers; verify on a real
+  device before relying on it.
+- Previous-button back-navigation can show stale server-computed content (see
+  `allow_previous`).
 """

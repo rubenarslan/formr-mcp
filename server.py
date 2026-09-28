@@ -41,7 +41,7 @@ from formr_mcp.utils import (
     run_filepath,
     validate_run_name,
 )
-from formr_mcp.validation import get_unit_type_schemas, validate_structure
+from formr_mcp.validation import SURVEY_UNIT_TYPES, get_unit_type_schemas, validate_structure
 
 RunName = Annotated[str, Field(pattern=r"^[a-zA-Z][a-zA-Z0-9-]{2,255}$", min_length=3, max_length=256)]
 
@@ -334,7 +334,7 @@ def _normalize_survey_choices(structure: dict) -> None:
     expects.  Without this, items with choices but no choice_list are silently
     dropped by the server."""
     for unit in structure.get("units", []):
-        if unit.get("type") == "Survey" and isinstance(unit.get("survey_data"), dict):
+        if unit.get("type") in SURVEY_UNIT_TYPES and isinstance(unit.get("survey_data"), dict):
             items = unit["survey_data"].get("items", [])
             if isinstance(items, list):
                 for item in items:
@@ -471,7 +471,7 @@ def get_unit_types(ctx: Context = None) -> dict:
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_documentation(
-    topic: Literal["item-types", "run-concepts", "r-code", "survey-json", "examples", "best-practices", "editing-tools", "unit-types-advanced", "data-access", "patterns", "custom-r-and-secrets"],
+    topic: Literal["item-types", "run-concepts", "r-code", "survey-json", "examples", "best-practices", "editing-tools", "unit-types-advanced", "data-access", "patterns", "custom-r-and-secrets", "form-v2"],
     section: str | None = None,
     ctx: Context = None,
 ) -> str:
@@ -489,7 +489,7 @@ def get_documentation_topics(ctx: Context = None) -> list[dict]:
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_documentation_sections(
-    topic: Literal["item-types", "run-concepts", "r-code", "survey-json", "examples", "best-practices", "editing-tools", "unit-types-advanced", "data-access", "patterns", "custom-r-and-secrets"],
+    topic: Literal["item-types", "run-concepts", "r-code", "survey-json", "examples", "best-practices", "editing-tools", "unit-types-advanced", "data-access", "patterns", "custom-r-and-secrets", "form-v2"],
     ctx: Context = None,
 ) -> list[dict]:
     """List the H2 sections available within a documentation topic.
@@ -571,12 +571,17 @@ def add_run_unit(name: RunName, unit_type: str, position: int, description: str 
       Branch/SkipForward/SkipBackward: condition (R expr), if_true (int position)
       Email: subject, body, account_id (int), recipient_field
       Survey: study_id (int) or survey_data (dict)
+      Form: study_id (int) — form_v2 renderer; sets the study's rendering_mode='v2'
       External: address (URL or R code)
       Wait: body (int position — NOT display content)
       Page/Endpage: body (markdown)
       Pause: wait_minutes, wait_until_time, wait_until_date, relative_to
 
     insert_mode: 'shift' (default) shifts units at >= position up by 10; 'overwrite' replaces. Position references are auto-remapped.
+
+    Form gotcha: the run-structure export omits a Form's study_id, so re-add it
+    to .formr/<name>.json before uploading or the unit loses its study. See
+    get_documentation("form-v2").
     """
     validate_run_name(name)
     return editing_add_run_unit(name, unit_type, position, description=description,

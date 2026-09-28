@@ -5,6 +5,7 @@ import subprocess
 from typing import Any
 
 from formr_mcp.utils import load_structure
+from formr_mcp.validation import SURVEY_UNIT_TYPES
 
 _R_AVAILABLE: bool | None = None
 
@@ -118,7 +119,7 @@ def _extract_r_expressions(structure: dict) -> list[dict]:
                         "type": "knitr_chunk",
                     })
 
-        if utype == "Survey":
+        if utype in SURVEY_UNIT_TYPES:
             sd = unit.get("survey_data")
             if not isinstance(sd, dict):
                 continue
@@ -216,7 +217,7 @@ def _check_variable_references(structure: dict) -> list[dict]:
     survey_positions: dict[str, int] = {}
 
     for unit in units:
-        if unit.get("type") != "Survey":
+        if unit.get("type") not in SURVEY_UNIT_TYPES:
             continue
         sd = unit.get("survey_data")
         if not isinstance(sd, dict):
@@ -423,7 +424,7 @@ def _check_item_consistency(structure: dict) -> list[dict]:
     units = structure.get("units", [])
 
     for unit in units:
-        if unit.get("type") != "Survey":
+        if unit.get("type") not in SURVEY_UNIT_TYPES:
             continue
         sd = unit.get("survey_data")
         if not isinstance(sd, dict):

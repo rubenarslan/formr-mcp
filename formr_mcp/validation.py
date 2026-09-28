@@ -3,7 +3,7 @@
 # that it can't create turns a clear validation error into an opaque
 # "Import incomplete" from the server.
 KNOWN_TYPES = {
-    "Survey", "Page", "Email",
+    "Survey", "Form", "Page", "Email",
     "SkipForward", "SkipBackward",
     "External", "Pause", "Wait",
     "Shuffle", "PushMessage", "Endpage",
@@ -18,12 +18,19 @@ UNSUPPORTED_TYPES = {
 
 BRANCH_TYPES = {"SkipForward", "SkipBackward"}
 
+# Unit types that present a SurveyStudy to the participant and can therefore
+# carry `survey_data` / `study_id`. `Form` is the form_v2 engine's unit type
+# (PHP RunUnit\Form extends RunUnit\Survey); everything that special-cases
+# "a unit with items" should treat both alike.
+SURVEY_UNIT_TYPES = {"Survey", "Form"}
+
 # Items that MUST define choices (mirrors PHP $hasChoices = true, no auto-generation)
 CHOICES_REQUIRED = {
     "mc", "mc_button", "mc_multiple", "mc_multiple_button", "mc_heading",
     "choose_two_weekdays",
     "select_one", "select_multiple", "select_or_add_one",
-    "range", "range_ticks", "rating_button",
+    "range", "range_ticks", "rating_button", "visual_analog_scale",
+    "rank",
     "add_to_home_screen", "push_notification", "request_cookie",
 }
 
@@ -41,21 +48,37 @@ CHOICES_FORBIDDEN = {
 
 # Items where choices are allowed but not required are not explicitly
 # listed — they pass through validation without error in either case.
-# This includes: select_or_add_multiple, sex
+# This includes: select_or_add_multiple, sex, bot_check (BotCheck_Item
+# blanks its choices before calling parent::validate(), so choice1..3 are
+# accepted as widget copy without being mandatory).
 
+# Item types that only render fully under the form_v2 engine (a Form unit /
+# a study with rendering_mode='v2'). Their JS lives in the `form` webpack
+# bundle, which a v1 Survey unit never loads — a v1 render degrades to the
+# bare hidden inputs. Not a validation error: the sheet still imports.
+FORM_V2_ONLY_ITEM_TYPES = {"rank", "bot_check"}
+
+# Derived from application/Model/Item/*.php: formr maps a spreadsheet `type`
+# to a class by replacing '-' with '_', ucwords-ing each '_'-delimited part
+# and appending '_Item' (Item::getItemClass). So `visual_analog_scale` →
+# `VisualAnalogScale_Item`, `bot_check` → `BotCheck_Item`, and both
+# `datetime-local` and `datetime_local` reach `DatetimeLocal_Item`.
 KNOWN_ITEM_TYPES = {
     "note", "note_iframe", "block", "submit",
     "text", "textarea", "number", "letters", "email", "url", "tel", "cc", "blank",
-    "date", "datetime", "datetime-local", "time", "month", "week", "year", "yearmonth",
+    "date", "datetime", "datetime-local", "datetime_local",
+    "time", "month", "week", "year", "yearmonth",
     "mc", "mc_button", "mc_multiple", "mc_multiple_button", "mc_heading",
     "check", "check_button", "choose_two_weekdays",
     "select_one", "select_multiple", "select_or_add_one", "select_or_add_multiple",
     "timezone",
-    "range", "range_ticks", "rating_button", "sex",
+    "range", "range_ticks", "rating_button", "visual_analog_scale", "sex",
+    "rank",
     "calculate", "hidden", "get", "server", "browser", "ip", "referrer", "random",
     "file", "image", "audio", "video",
     "geopoint", "color",
     "request_phone", "add_to_home_screen", "push_notification", "request_cookie",
+    "bot_check",
 }
 
 
@@ -63,7 +86,22 @@ UNIT_SCHEMAS: dict[str, dict[str, list[str] | str]] = {
     "Survey": {
         "required": ["type", "position"],
         "optional": ["description", "special", "study_id", "survey_data"],
-        "description": "A survey/questionnaire presented to the participant.",
+        "description": "A survey/questionnaire presented to the participant (legacy v1 engine, one page per request).",
+    },
+    # form_v2. A Form keeps its OWN survey_units row (type='Form') and points
+    # at its SurveyStudy through survey_units.form_study_id — unlike Survey,
+    # which shares its primary key with the study. Creating one stamps
+    # rendering_mode='v2' on the referenced study.
+    "Form": {
+        "required": ["type", "position"],
+        "optional": ["description", "special", "study_id", "survey_data"],
+        "description": (
+            "A survey rendered by the form_v2 engine: the whole study is delivered as one "
+            "AJAX single-page form (client-side showif, offline queue, optional Previous "
+            "button). Pass study_id to wire an existing study — creating the unit sets that "
+            "study's rendering_mode='v2'. NOTE: the run-structure export does not round-trip "
+            "a Form's study reference; see get_documentation('form-v2')."
+        ),
     },
     # Page and Endpage are the same unit type in formr (class Page, type 'Endpage').
     # When you create a 'Page' unit, formr normalizes its type to 'Endpage' on upload.
@@ -299,10 +337,10 @@ def validate_structure(data: dict) -> list[str]:
                     f"'if_true' must be an integer, got {type(if_true).__name__}"
                 )
 
-        if unit_type == "Survey" and "survey_data" in unit:
+        if unit_type in SURVEY_UNIT_TYPES and "survey_data" in unit:
             survey_errors = validate_survey_data(
                 unit["survey_data"],
-                f"Survey unit at position {pos}",
+                f"{unit_type} unit at position {pos}",
             )
             errors.extend(survey_errors)
 
@@ -328,7 +366,7 @@ def validate_structure(data: dict) -> list[str]:
             errors.append(
                 f"The run starts with a '{first_type}' at position {first_pos} — "
                 f"Page and Endpage units must follow a content unit (e.g. Survey), "
-                f"not lead the run. Use a Survey unit as the entry point."
+                f"not lead the run. Use a Survey (or Form) unit as the entry point."
             )
 
     return errors
