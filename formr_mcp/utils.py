@@ -48,6 +48,31 @@ def safe_run_filepath(name: str) -> Path:
     return path
 
 
+def workspace_file(path: str) -> Path:
+    """Resolve a file the caller names for upload: relative to the workspace,
+    or absolute but inside it. Symlinks are resolved first, so one pointing
+    out of the workspace is refused too.
+
+    The MCP may serve over HTTP from a shared host, where reading any path the
+    model names would hand it the server's own files (its .env among them) to
+    upload into a run. Raises ValueError outside the workspace, or when the
+    file is missing.
+    """
+    workspace = WORKSPACE_DIR.resolve()
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = WORKSPACE_DIR / candidate
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(workspace):
+        raise ValueError(
+            f"'{path}' is outside the MCP workspace ({workspace}). Copy the file into "
+            f"the workspace first, or pass its content as text or content_base64."
+        )
+    if not resolved.is_file():
+        raise ValueError(f"No such file in the workspace: {resolved}")
+    return resolved
+
+
 def run_filepath(name: str) -> Path:
     """Like safe_run_filepath but also creates the workspace directory if needed."""
     path = safe_run_filepath(name)
