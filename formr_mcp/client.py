@@ -245,8 +245,19 @@ class FormrClient:
         since: str | None = None,
         limit: int = 1000,
         offset: int = 0,
+        include_log: bool = False,
     ) -> list[dict]:
         validate_run_name(run)
+        params = self._log_params(session, testing, since, limit, offset)
+        if include_log:
+            params["include_log"] = "true"
+        return await self.request(
+            "GET", f"api/v1/runs/{quote(run, safe='')}/unit_sessions", params=params
+        )
+
+    @staticmethod
+    def _log_params(session: str | None, testing: bool | None, since: str | None,
+                    limit: int, offset: int) -> dict[str, Any]:
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if session:
             params["session"] = session
@@ -254,8 +265,54 @@ class FormrClient:
             params["testing"] = "true" if testing else "false"
         if since:
             params["since"] = since
+        return params
+
+    async def get_logs(
+        self,
+        run: str,
+        kind: str,
+        *,
+        session: str | None = None,
+        testing: bool | None = None,
+        since: str | None = None,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> list[dict]:
+        """GET /runs/{run}/logs/{email|push} (formr with the logs endpoint)."""
+        validate_run_name(run)
+        if kind not in ("email", "push"):
+            raise ValueError("kind must be 'email' or 'push'")
         return await self.request(
-            "GET", f"api/v1/runs/{quote(run, safe='')}/unit_sessions", params=params
+            "GET", f"api/v1/runs/{quote(run, safe='')}/logs/{kind}",
+            params=self._log_params(session, testing, since, limit, offset),
+        )
+
+    # --- writing sessions (V1) ---
+
+    async def create_sessions(
+        self, run: str, *, codes: list[str] | None = None, testing: bool = True
+    ) -> dict:
+        """POST /runs/{run}/sessions. Without codes formr makes one random
+        code; with codes, one session per code (207 when some failed)."""
+        validate_run_name(run)
+        body: dict[str, Any] = {"testing": testing}
+        if codes:
+            body["code"] = codes
+        return await self.request(
+            "POST", f"api/v1/runs/{quote(run, safe='')}/sessions", json=body
+        )
+
+    async def session_action(
+        self, run: str, code: str, action: str, *, position: int | None = None
+    ) -> Any:
+        validate_run_name(run)
+        body: dict[str, Any] = {"action": action}
+        if position is not None:
+            body["position"] = position
+        return await self.request(
+            "POST",
+            f"api/v1/runs/{quote(run, safe='')}/sessions/{quote(code, safe='')}/actions",
+            json=body,
         )
 
     async def get_results(
@@ -281,3 +338,20 @@ class FormrClient:
     async def get_run_files(self, run: str) -> list[dict]:
         validate_run_name(run)
         return await self.request("GET", f"api/v1/runs/{quote(run, safe='')}/files")
+
+    async def upload_run_file(
+        self, run: str, filename: str, content: bytes, content_type: str = "application/octet-stream"
+    ) -> dict:
+        """POST /runs/{run}/files as multipart/form-data, field "file".
+        Bytes, not a file object, so the 401 retry can send them again."""
+        validate_run_name(run)
+        return await self.request(
+            "POST", f"api/v1/runs/{quote(run, safe='')}/files",
+            files={"file": (filename, content, content_type)},
+        )
+
+    async def delete_run_file(self, run: str, filename: str) -> Any:
+        validate_run_name(run)
+        return await self.request(
+            "DELETE", f"api/v1/runs/{quote(run, safe='')}/files/{quote(filename, safe='')}"
+        )

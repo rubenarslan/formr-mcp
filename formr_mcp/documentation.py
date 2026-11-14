@@ -1847,8 +1847,9 @@ existing ones. Never use consecutive positions (1, 2, 3) unless the run is final
 **Branch always has a fallthrough**: Make sure there's a default path when all
 branch conditions are FALSE. The fallthrough continues to the next position.
 
-**Test with a small session**: Before launching, create a test session with
-`testing=true` and walk through the entire run.
+**Test with a small session**: Before launching, create a test session
+(`create_test_sessions`) and walk through the entire run in a browser; `get_run_logs`
+shows R errors and skipped emails along the way.
 
 **Cron for automated actions**: Set `cron_active=1` in settings and use
 `cron_only=1` on Email units that should only fire from cron, not on first visit.
@@ -2260,6 +2261,20 @@ The MCP can read a live run directly — useful while designing or debugging:
 | `get_run_results` | raw survey responses (filter by survey/session/item) | data:read |
 | `list_run_files` | uploaded-file metadata | file:read |
 | `get_survey_structure` | item tables + choice lists (definitions, not data) | survey:read |
+| `get_run_logs` | the engine's logs: per-unit result + result_log (R errors), email log, push log | session:read + data:read |
+
+And to try a run out and maintain its files:
+
+| Tool | Does | Scope |
+|------|------|-------|
+| `create_test_sessions` | new **test** sessions (random or given codes) with their test links | session:write |
+| `test_session_action` | advance / execute / move_to_position / end_external — test sessions only | session:write |
+| `upload_run_file` / `delete_run_file` | a run's files (from the workspace, text, or base64) | file:write |
+
+**Testing a run end to end:** `create_test_sessions` → open the returned `test_link` in a
+browser (Playwright) and answer as a participant → `test_session_action` to skip a Pause or
+jump to a position → `list_unit_sessions` / `get_run_results` / `get_run_logs` to check what
+happened. The MCP refuses to act on real participants' sessions whatever the data gate says.
 
 **Token limits are surfaced, not guessed.** Call `whoami` first: it reports the
 token's granted scopes, whether it is read-only, its run allowlist (e.g. "limited
@@ -2270,7 +2285,7 @@ them from `whoami`.
 on what the MCP may read:
 
 - `test_only` (default) — only **test** sessions (`testing=1`) are ever readable.
-  `list_sessions`/`list_unit_sessions`/`get_run_results` silently restrict to test
+  `list_sessions`/`list_unit_sessions`/`get_run_results`/`get_run_logs` silently restrict to test
   data; `get_session` on a real participant and any explicit `testing=false` are
   refused. This is the GDPR-safe default.
 - `all` — real participant data is readable; you may still filter test/real per call.

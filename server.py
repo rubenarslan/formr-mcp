@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
+import mimetypes
 import os
 import webbrowser
 from contextlib import asynccontextmanager
@@ -40,6 +43,7 @@ from formr_mcp.summarize import find_items, summarize_run_structure
 from formr_mcp.utils import (
     run_filepath,
     validate_run_name,
+    workspace_file,
 )
 from formr_mcp.validation import get_unit_type_schemas, validate_structure
 
@@ -73,6 +77,11 @@ TOOL_SCOPES = {
     "list_unit_sessions": "session:read",
     "get_run_results": "data:read",
     "list_run_files": "file:read",
+    "upload_run_file": "file:write",
+    "delete_run_file": "file:write",
+    "create_test_sessions": "session:write",
+    "test_session_action": "session:write",
+    "get_run_logs": "data:read",
     "get_survey_structure": "survey:read",
 }
 _WRITE_SCOPES = {"run:write", "survey:write", "session:write", "user:write", "file:write"}
@@ -102,7 +111,9 @@ def _build_capability_report(caps: dict, token_scopes: list[str]) -> dict:
     for tool, scope in TOOL_SCOPES.items():
         if scope not in scope_set:
             tool_access[tool] = f"blocked: requires '{scope}' scope"
-        elif tool == "get_run_results" and mode == gate.TEST_ONLY:
+        elif tool == "get_run_logs" and "session:read" not in scope_set:
+            tool_access[tool] = "blocked: requires 'session:read' and 'data:read' scopes"
+        elif tool in ("get_run_results", "get_run_logs") and mode == gate.TEST_ONLY:
             tool_access[tool] = "available: TEST sessions only (FORMR_DATA_ACCESS=test_only)"
         else:
             tool_access[tool] = "available"
@@ -156,6 +167,12 @@ READING DATA — six read tools inspect a live run (handy for designing/debuggin
   get_run_results                 raw survey responses (filter by survey/session/item)
   list_run_files                  uploaded-file metadata
   get_survey_structure            item tables + choice lists (definitions, not data)
+  get_run_logs                    the engine's logs: unit results + R errors, email, push
+TESTING A RUN — create_test_sessions(name) returns test codes with their links; open a link
+in a browser (Playwright) to take the run as that participant; test_session_action moves a
+test session on (advance past a Pause, move_to_position, execute); then list_unit_sessions,
+get_run_results and get_run_logs show what happened. Real participants are never changed.
+RUN FILES — upload_run_file (from the workspace, text or base64) / delete_run_file.
 DATA GATE (GDPR): FORMR_DATA_ACCESS sets a HARD ceiling, default `test_only` —
 only test sessions (testing=1) are ever readable; reads of real participant data
 are refused until an operator sets FORMR_DATA_ACCESS=all and restarts. For
@@ -752,6 +769,206 @@ async def list_run_files(name: RunName, ctx: Context = None) -> list[dict]:
     """
     validate_run_name(name)
     return await _client(ctx).get_run_files(name)
+
+
+# --- test sessions (write) ---
+
+_MAX_NEW_SESSIONS = 50
+_SESSION_ACTIONS = ("advance", "execute", "move_to_position", "end_external")
+
+
+def _test_link(run_link: str | None, code: str) -> str | None:
+    if not run_link:
+        return None
+    return f"{run_link}{'&' if '?' in run_link else '?'}code={code}"
+
+
+async def _require_test_session(client: FormrClient, name: str, code: str) -> dict:
+    """The session, if it is a test session. The MCP changes nothing of a real
+    participant's, whatever FORMR_DATA_ACCESS says: that ceiling is about
+    reading, and moving someone through a live study is the researcher's call."""
+    sess = await client.get_session(name, code)
+    if not gate.is_test_session(sess):
+        raise gate.DataAccessError(
+            f"Session '{code}' is not a test session. The MCP acts on test sessions only; "
+            "move real participants in formr's admin area (the run's Sessions page)."
+        )
+    return sess
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def create_test_sessions(name: RunName, count: int = 1, codes: list[str] | None = None,
+                               ctx: Context = None) -> dict:
+    """Create test sessions in a run (always testing=1) and return each code with its test
+    link, `<run link>?code=<code>`. Open a link in a browser (e.g. Playwright) to go through
+    the run as that participant; the session's data is then readable under the default
+    FORMR_DATA_ACCESS=test_only, and test_session_action moves it along (advance a Pause,
+    jump to a position, run the engine).
+
+    Either `count` random codes (1-50), or your own `codes`, which must match the
+    instance's session-code pattern (by default 64 characters of A-Z a-z 0-9 _ - ~ +).
+    Scope: session:write.
+    """
+    validate_run_name(name)
+    client = _client(ctx)
+    created: list[str] = []
+    errors: list = []
+    if codes:
+        if len(codes) > _MAX_NEW_SESSIONS:
+            raise ValueError(f"At most {_MAX_NEW_SESSIONS} codes per call.")
+        resp = await client.create_sessions(name, codes=codes, testing=True)
+        created = list((resp or {}).get("sessions") or [])
+        errors = list((resp or {}).get("errors") or [])
+    else:
+        if not 1 <= count <= _MAX_NEW_SESSIONS:
+            raise ValueError(f"count must be between 1 and {_MAX_NEW_SESSIONS}.")
+        for _ in range(count):
+            resp = await client.create_sessions(name, testing=True)
+            created.extend((resp or {}).get("sessions") or [])
+    link = (await client.get_run(name)).get("link")
+    out: dict = {"created": [{"code": c, "test_link": _test_link(link, c)} for c in created]}
+    if errors:
+        out["errors"] = errors
+    return out
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False, openWorldHint=False))
+async def test_session_action(name: RunName, code: str,
+                              action: Literal["advance", "execute", "move_to_position", "end_external"],
+                              position: int | None = None, ctx: Context = None) -> dict:
+    """Move a TEST session through a run, as the admin's test tools do:
+
+      advance           end the current unit (result 'moved') and go on to the next one —
+                        e.g. skip a Pause or Wait instead of waiting it out
+      execute           run the engine for the session now, as the daemon would
+      move_to_position  send the session to `position` (required) and run that unit
+      end_external      end the current External unit, as its service's callback would
+
+    Refuses real participants' sessions, whatever FORMR_DATA_ACCESS allows. Returns formr's
+    answer and the session afterwards (position, current unit). Scope: session:write.
+    """
+    validate_run_name(name)
+    if action == "move_to_position" and position is None:
+        raise ValueError("move_to_position needs a position.")
+    client = _client(ctx)
+    await _require_test_session(client, name, code)
+    resp = await client.session_action(
+        name, code, action, position=position if action == "move_to_position" else None
+    )
+    return {"action": action, "response": resp or "ok", "session": await client.get_session(name, code)}
+
+
+# --- logs ---
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_run_logs(name: RunName, kind: Literal["unit", "email", "push"] = "unit",
+                       session: str | None = None, testing: bool | None = None,
+                       since: str | None = None, only_with_log: bool = True,
+                       limit: int = 1000, offset: int = 0, ctx: Context = None) -> dict:
+    """What the run's engine logged, as formr's admin log pages show it — the place to look
+    when a test session did something unexpected:
+
+      unit   per unit session: result and result_log (an R error and its output, a
+             branch's verdict, why an email was skipped); only rows with a log unless
+             only_with_log=False
+      email  the Email log: to, subject, status (sent / failed / invalid recipient …),
+             tries, sent, with the unit session's result and result_log
+      push   the Push log: message, status, error, attempt
+
+    Filters: session (comma-separated codes), testing, since (ISO 8601); limit/offset page
+    through the rows before only_with_log is applied. FORMR_DATA_ACCESS=test_only (default)
+    restricts every kind to test sessions. Email and push logs need a formr with the logs
+    endpoint (v2 line after rc12); the unit log's result_log likewise. Scopes: session:read
+    and data:read.
+    """
+    validate_run_name(name)
+    effective = gate.resolve_testing(testing)
+    client = _client(ctx)
+    note = None
+    if kind == "unit":
+        rows = await client.get_unit_sessions(name, session=session, testing=effective,
+                                              since=since, limit=limit, offset=offset,
+                                              include_log=True)
+        if rows and not any("result_log" in r for r in rows if isinstance(r, dict)):
+            note = ("This formr does not return result_log yet (it ignores include_log); "
+                    "only results are shown.")
+        elif only_with_log:
+            rows = [r for r in rows if isinstance(r, dict) and r.get("result_log")]
+    else:
+        try:
+            rows = await client.get_logs(name, kind, session=session, testing=effective,
+                                         since=since, limit=limit, offset=offset)
+        except FormrClientError as e:
+            if "-> 404" in str(e) and "logs" in str(e):
+                raise FormrClientError(
+                    f"This formr instance has no {kind} log endpoint yet "
+                    f"(GET /api/v1/runs/{{name}}/logs/{kind}); it needs a newer formr."
+                ) from e
+            raise
+    if gate.data_access_mode() == gate.TEST_ONLY:
+        # The server filtered by testing already; a row that isn't a test
+        # session's (a push log whose unit session is gone) never passes.
+        rows = [r for r in rows if gate.is_test_session(r)]
+    out: dict = {"kind": kind, "count": len(rows), "rows": rows}
+    if note:
+        out["note"] = note
+    return out
+
+
+# --- run files (write) ---
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def upload_run_file(name: RunName, path: str | None = None, filename: str | None = None,
+                          text: str | None = None, content_base64: str | None = None,
+                          ctx: Context = None) -> dict:
+    """Upload a file to a run (an image, a CSS or JS file, a PDF, a CSV the run's R reads)
+    and return its entry with the URL to use in the run. Give exactly one of:
+
+      path            a file in the MCP workspace (FORMR_WORKSPACE_DIR, default .formr/),
+                      relative to it or absolute inside it; nothing outside is read
+      text            the file's content as text (needs filename)
+      content_base64  binary content, base64-encoded (needs filename)
+
+    formr keeps letters, digits, '.', '_' and '-' of the name and replaces the rest with
+    '_'; it refuses file types it doesn't take. An existing file of that name is replaced.
+    Scope: file:write.
+    """
+    validate_run_name(name)
+    given = [x for x in (path, text, content_base64) if x is not None]
+    if len(given) != 1:
+        raise ValueError("Give exactly one of path, text or content_base64.")
+    if path is not None:
+        file = workspace_file(path)
+        content = file.read_bytes()
+        filename = filename or file.name
+    else:
+        if not filename:
+            raise ValueError("filename is required with text or content_base64.")
+        if text is not None:
+            content = text.encode("utf-8")
+        else:
+            try:
+                content = base64.b64decode(content_base64, validate=True)
+            except (binascii.Error, ValueError) as e:
+                raise ValueError(f"content_base64 is not valid base64: {e}") from e
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    client = _client(ctx)
+    resp = await client.upload_run_file(name, filename, content, content_type)
+    stored = (resp or {}).get("file") or filename
+    entry = next((f for f in (await client.get_run_files(name) or [])
+                  if isinstance(f, dict) and f.get("name") == stored), None)
+    return {"file": stored, "bytes": len(content), "messages": (resp or {}).get("messages"),
+            "entry": entry}
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True, openWorldHint=False))
+async def delete_run_file(name: RunName, filename: str, ctx: Context = None) -> str:
+    """Delete a file uploaded to a run, by its name as list_run_files shows it. A study page
+    still linking it then shows a broken image or loses its script. Scope: file:write.
+    """
+    validate_run_name(name)
+    await _client(ctx).delete_run_file(name, filename)
+    return f"Deleted '{filename}' from run '{name}'."
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
