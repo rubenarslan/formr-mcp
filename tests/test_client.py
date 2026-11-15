@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from formr_mcp.client import FormrClient, FormrClientError, _resolve_timeout
+from formr_mcp.client import FormrClient, FormrClientError, resolve_timeout
 
 
 class TestHttpTimeout:
@@ -18,26 +18,26 @@ class TestHttpTimeout:
 
     def test_default_is_generous_not_five_seconds(self, monkeypatch):
         monkeypatch.delenv("FORMR_HTTP_TIMEOUT", raising=False)
-        t = _resolve_timeout()
+        t = resolve_timeout()
         assert t.read == 60.0
         assert t.write == 60.0
         assert t.connect == 10.0
 
     def test_env_override(self, monkeypatch):
         monkeypatch.setenv("FORMR_HTTP_TIMEOUT", "120")
-        t = _resolve_timeout()
+        t = resolve_timeout()
         assert t.read == 120.0
         assert t.connect == 10.0  # capped at min(10, 120)
 
     def test_small_timeout_also_caps_connect(self, monkeypatch):
         monkeypatch.setenv("FORMR_HTTP_TIMEOUT", "3")
-        t = _resolve_timeout()
+        t = resolve_timeout()
         assert t.read == 3.0
         assert t.connect == 3.0
 
     def test_invalid_env_falls_back_to_default(self, monkeypatch):
         monkeypatch.setenv("FORMR_HTTP_TIMEOUT", "not-a-number")
-        assert _resolve_timeout().read == 60.0
+        assert resolve_timeout().read == 60.0
 
     def test_client_uses_resolved_timeout(self, monkeypatch):
         monkeypatch.delenv("FORMR_HTTP_TIMEOUT", raising=False)

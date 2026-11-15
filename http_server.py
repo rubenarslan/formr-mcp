@@ -1,88 +1,89 @@
-"""Streamable-HTTP entrypoint for formr-mcp with a static bearer-token gate.
+"""Streamable-HTTP entrypoint for formr-mcp: one server for every researcher
+of a formr instance, who adds it to Claude by its URL.
 
-Serves the same FastMCP tool surface as `server.py` (stdio), but over HTTP at
-`/mcp`, so the server can be reached remotely (behind a reverse proxy / TLS).
-Every request except `/healthz` must carry `Authorization: Bearer <token>`,
-where <token> == $MCP_BEARER_TOKEN. This is deliberately a single shared
-secret — coarse but sufficient as the network edge gate; the formr API itself
-is still protected by the per-credential OAuth scopes in the bind-mounted .env.
+formr is the OAuth authorization server (formr's OAuthConnectors): a client
+without a token gets a 401 naming this server's protected resource metadata
+(/.well-known/oauth-protected-resource/mcp), which names formr's admin origin
+as the issuer; the researcher signs in on formr and chooses the scopes and
+runs the connection gets. Every request then carries that connection's
+token: FormrTokenVerifier asks formr whose it is (GET /api/v1/user/token),
+and the tools call formr's API with that same token, so formr's scopes, run
+allowlist and run ownership decide what each call may do. This server holds
+no credential, no secret and no files, and keeps no session state
+(stateless_http): any replica can answer any request.
 
-Importing `server` runs its load_dotenv(), so $MCP_BEARER_TOKEN and the
-FORMR_* credentials are read from the same .env file.
+Environment:
+  FORMR_BASE_URL   formr's admin origin (the issuer), e.g. https://formr.example.org
+  MCP_PUBLIC_URL   this server's URL as researchers add it, e.g. https://formr.example.org/mcp
+                   (formr's FORMR_MCP_URL must be the same)
+  MCP_HTTP_HOST / MCP_HTTP_PORT / MCP_LOG_LEVEL
 """
 from __future__ import annotations
 
-import hmac
 import os
 from urllib.parse import urlparse
 
 import uvicorn
-from starlette.responses import JSONResponse
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.responses import JSONResponse
 
 # Triggers server.py's load_dotenv() + builds the FastMCP instance (`mcp`).
-from server import mcp
+import server
+from formr_mcp.auth import FormrTokenVerifier
 
 
-class BearerAuthMiddleware:
-    """Pure-ASGI guard. Passes through non-HTTP scopes (notably `lifespan`, so
-    the wrapped app's session-manager + FormrClient lifespan still runs)."""
+class HealthzMiddleware:
+    """Answers /healthz without a token (the container's healthcheck); passes
+    everything else, `lifespan` included, to the app."""
 
-    def __init__(self, app, token: str):
+    def __init__(self, app):
         self.app = app
-        self._expected = f"Bearer {token}"
-        self._enabled = bool(token)
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        if scope.get("path") == "/healthz":
+        if scope["type"] == "http" and scope.get("path") == "/healthz":
             await JSONResponse({"status": "ok"})(scope, receive, send)
             return
-
-        headers = dict(scope.get("headers") or [])
-        provided = headers.get(b"authorization", b"").decode()
-        if not self._enabled or not hmac.compare_digest(provided, self._expected):
-            await JSONResponse(
-                {"error": "unauthorized", "message": "missing or invalid bearer token"},
-                status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
-            )(scope, receive, send)
-            return
-
         await self.app(scope, receive, send)
 
 
-def main() -> None:
-    token = os.environ.get("MCP_BEARER_TOKEN", "").strip()
-    if not token:
-        raise SystemExit("MCP_BEARER_TOKEN is not set — refusing to start an unauthenticated server.")
+def build_app():
+    base_url = os.environ.get("FORMR_BASE_URL", "").strip().rstrip("/")
+    public_url = os.environ.get("MCP_PUBLIC_URL", "").strip().rstrip("/")
+    if not base_url or not public_url:
+        raise SystemExit("FORMR_BASE_URL and MCP_PUBLIC_URL must be set.")
+    mcp_path = urlparse(public_url).path or "/mcp"
 
-    host = os.environ.get("MCP_HTTP_HOST", "0.0.0.0")
-    port = int(os.environ.get("MCP_HTTP_PORT", "8000"))
+    server.configure_http_mode()
+    mcp = server.mcp
+    mcp.settings.stateless_http = True
+    mcp.settings.json_response = True
+    mcp.settings.streamable_http_path = mcp_path
+    # required_scopes stays None: the SDK enforces it on every request, and
+    # each tool's scope is formr's to check (whoami lists them)
+    mcp.settings.auth = AuthSettings(issuer_url=base_url, resource_server_url=public_url)
+    mcp._token_verifier = FormrTokenVerifier(base_url, server.shared_http(), resource=public_url)
 
     # DNS-rebinding protection defaults to localhost-only; behind a reverse
-    # proxy the public Host header must be allowlisted or every request 421s
-    # with "Invalid Host header". Default to the FORMR_BASE_URL host (the /mcp
-    # endpoint lives on the same admin domain).
-    allowed_host = os.environ.get("MCP_ALLOWED_HOST", "").strip()
-    if not allowed_host:
-        allowed_host = urlparse(os.environ.get("FORMR_BASE_URL", "")).hostname or ""
-    if allowed_host:
-        mcp.settings.transport_security = TransportSecuritySettings(
-            enable_dns_rebinding_protection=True,
-            allowed_hosts=[allowed_host, f"{allowed_host}:*"],
-            allowed_origins=[f"https://{allowed_host}", f"https://{allowed_host}:*"],
-        )
+    # proxy the public Host header must be allowlisted or every request 421s.
+    host = urlparse(public_url).hostname or ""
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[host, f"{host}:*"],
+        allowed_origins=[f"https://{host}", f"https://{host}:*"],
+    )
+    return HealthzMiddleware(mcp.streamable_http_app())
 
-    app = mcp.streamable_http_app()  # mounts the MCP endpoint at settings.streamable_http_path (/mcp)
+
+def main() -> None:
     uvicorn.run(
-        BearerAuthMiddleware(app, token),
-        host=host,
-        port=port,
+        build_app(),
+        host=os.environ.get("MCP_HTTP_HOST", "0.0.0.0"),
+        port=int(os.environ.get("MCP_HTTP_PORT", "8000")),
         log_level=os.environ.get("MCP_LOG_LEVEL", "info"),
+        # behind Traefik: the client's address and scheme from its headers
+        proxy_headers=True,
+        forwarded_allow_ips=os.environ.get("MCP_FORWARDED_ALLOW_IPS", "*"),
     )
 
 

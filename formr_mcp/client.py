@@ -11,7 +11,7 @@ import httpx
 log = logging.getLogger("formr_mcp.client")
 
 
-def _resolve_timeout() -> httpx.Timeout:
+def resolve_timeout() -> httpx.Timeout:
     """Per-request timeout for formr API calls.
 
     httpx defaults to 5s on every phase, which is too tight for slower or
@@ -36,6 +36,11 @@ class FormrClientError(Exception):
     pass
 
 
+class FormrAuthExpired(FormrClientError):
+    """A caller's own token (HTTP mode) was refused: the client must sign in again."""
+    pass
+
+
 class FormrPermissionError(FormrClientError):
     """Raised on a 403 from formr — the token lacks a scope or is not
     authorized for the run/survey. Carries an actionable hint so the
@@ -47,14 +52,20 @@ class FormrClient:
     def __init__(
         self,
         base_url: str,
-        client_id: str,
-        client_secret: str,
+        client_id: str | None = None,
+        client_secret: str | None = None,
         http_client: httpx.AsyncClient | None = None,
+        *,
+        access_token: str | None = None,
     ):
         self.base_url = base_url.rstrip("/") + "/"
         self.client_id = client_id
         self.client_secret = client_secret
-        self._http = http_client or httpx.AsyncClient(timeout=_resolve_timeout())
+        # A caller's own formr token (HTTP mode: the bearer token a client sent
+        # the MCP server, which formr issued it when its researcher connected).
+        # Used as it is: it is the client's to refresh, never this server's.
+        self._access_token = access_token
+        self._http = http_client or httpx.AsyncClient(timeout=resolve_timeout())
         self._token: OAuthToken | None = None
         self._owns_http = http_client is None
         self._capabilities: dict | None = None
@@ -70,6 +81,8 @@ class FormrClient:
         await self.aclose()
 
     async def _ensure_token(self) -> str:
+        if self._access_token is not None:
+            return self._access_token
         if self._token is None or self._token.is_expired:
             log.info("auth: requesting OAuth token from %s", self.base_url)
             self._token = await get_token(
@@ -113,6 +126,11 @@ class FormrClient:
         log.info("formr %s %s -> %s (%.0fms)", method, path, resp.status_code,
                  (time.perf_counter() - t0) * 1000)
 
+        if resp.status_code == 401 and self._access_token is not None:
+            raise FormrAuthExpired(
+                "formr no longer accepts this connection's token (expired, revoked, or the "
+                "connection was deleted under Account -> API). Reconnect the app to formr."
+            )
         if resp.status_code == 401 and not retried:
             self._token = None
             return await self.request(method, path, retried=True, **kwargs)
@@ -175,11 +193,18 @@ class FormrClient:
     async def get_user_me(self) -> dict:
         return await self.request("GET", "api/v1/user/me")
 
+    async def get_token_info(self) -> dict:
+        """GET /user/token: the calling token's account, scopes, expiry and runs
+        (no scope needed). The HTTP server checks every bearer token with it."""
+        return await self.request("GET", "api/v1/user/token")
+
     # --- capability / permission introspection ---
 
     async def scopes(self) -> list[str]:
         """The scopes granted to the current token, from the OAuth grant
         response (no extra request). Reliable for pre-checks."""
+        if self._access_token is not None:
+            return list((await self.get_capabilities()).get("scopes") or [])
         await self._ensure_token()
         raw = (self._token.scope or "").strip()
         return raw.split() if raw else []
@@ -188,7 +213,18 @@ class FormrClient:
         """Identity + capabilities from the extended GET /user/me
         (admin, scopes, allowed_runs). Memoized for the client's life."""
         if self._capabilities is None or refresh:
-            self._capabilities = await self.get_user_me()
+            if self._access_token is not None:
+                # a connection's token may lack user:read; /user/token needs none
+                info = await self.get_token_info()
+                self._capabilities = {
+                    "id": info.get("account_id"),
+                    "email": info.get("email"),
+                    "connection": info.get("label"),
+                    "scopes": info.get("scopes") or [],
+                    "allowed_runs": info.get("allowed_runs"),
+                }
+            else:
+                self._capabilities = await self.get_user_me()
         return self._capabilities
 
     def _permission_message(self, method: str, path: str, resp: httpx.Response) -> str:
@@ -201,6 +237,13 @@ class FormrClient:
             server_msg = resp.text[:300]
         base = self.base_url.rstrip("/")
         detail = f" {server_msg}" if server_msg else ""
+        if self._access_token is not None:
+            return (
+                f"Permission denied (403) for {method} {path}.{detail}\n"
+                f"This connection was not given the scope this needs, or not this run. "
+                f"Run `whoami` to see what it may do. The researcher can change that at "
+                f"{base}/admin/account#api (Connected apps), or connect the app again."
+            )
         return (
             f"Permission denied (403) for {method} {path}.{detail}\n"
             f"This API token is missing the required scope, or is not authorized for this run. "

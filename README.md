@@ -92,6 +92,33 @@ Add to `.cursor/mcp.json` in your project:
 
 Set `FORMR_BASE_URL`, `FORMR_CLIENT_ID`, and `FORMR_CLIENT_SECRET` in a `.env` file in the project root.
 
+## Hosted server: add formr to Claude by its URL
+
+A formr instance can run this server for all its researchers
+(`http_server.py`; formr-docker's `docker-compose-mcp.yml` layer). Nothing is
+configured per user:
+
+- **claude.ai / Claude Desktop:** Settings → Connectors → Add custom connector,
+  URL `https://<formr host>/mcp`.
+- **Claude Code:** `claude mcp add --transport http formr https://<formr host>/mcp`,
+  then `/mcp` to sign in.
+
+The client is sent to formr to sign in (login, 2FA, admin level 2) and to
+choose the connection's scopes and runs, as for an API credential. formr is
+the OAuth server: it identifies Claude by its client ID metadata document,
+requires PKCE, and lists each connection under Account → API, where the
+researcher changes or deletes it (deleting ends it at once). Every request
+carries that connection's token; the server checks it with formr
+(`GET /api/v1/user/token`) and calls the API with it, so formr's scopes, run
+allowlist and run ownership decide every call. The server keeps no
+credential, secret or file: the workspace tools fetch the run from formr and
+upload an edit in one step, and `get_run_structure_to_file`,
+`update_run_structure_from_file` and `open_flowchart` are not offered.
+`FORMR_DATA_ACCESS` (default `test_only`) is the operator's ceiling for every
+user. Environment: `FORMR_BASE_URL` (formr's admin origin, the issuer),
+`MCP_PUBLIC_URL` (this server's URL, formr's `FORMR_MCP_URL`). Needs formr
+v2.0.0-rc13 or later.
+
 ## Available Tools
 
 ### Run Management
@@ -237,7 +264,7 @@ Where stderr ends up depends on the client:
 - **Claude Code** — run `claude --debug` to see it inline; `/mcp` shows status.
 - **See it live / debug directly** — run the server yourself with the MCP
   Inspector: `npx @modelcontextprotocol/inspector uv run server.py`, or run the
-  HTTP entrypoint: `MCP_BEARER_TOKEN=dev MCP_LOG_LEVEL=debug uv run http_server.py`.
+  HTTP entrypoint: `FORMR_BASE_URL=https://formr.example.org MCP_PUBLIC_URL=https://formr.example.org/mcp MCP_LOG_LEVEL=debug uv run http_server.py`.
 
 ## Testing
 

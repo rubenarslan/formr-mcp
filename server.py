@@ -10,6 +10,7 @@ import webbrowser
 from contextlib import asynccontextmanager
 from typing import Annotated, AsyncIterator, Literal
 
+import httpx
 from pydantic import Field
 
 from dotenv import load_dotenv
@@ -22,7 +23,13 @@ dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 load_dotenv(dotenv_path)
 
 from formr_mcp.auth import AuthError, check_credentials
-from formr_mcp.client import FormrClient, FormrClientError, FormrPermissionError
+from formr_mcp.client import (
+    FormrAuthExpired,
+    FormrClient,
+    FormrClientError,
+    FormrPermissionError,
+    resolve_timeout,
+)
 from formr_mcp import data_access as gate
 from formr_mcp import documentation as doc
 from formr_mcp import google_sheets as gsheets
@@ -41,6 +48,7 @@ from formr_mcp.editing import (
 )
 from formr_mcp.summarize import find_items, summarize_run_structure
 from formr_mcp.utils import (
+    MEMORY_STRUCTURES,
     run_filepath,
     validate_run_name,
     workspace_file,
@@ -69,7 +77,7 @@ TOOL_SCOPES = {
     "get_run": "run:read",
     "get_run_structure_to_file": "run:read",
     "create_run": "run:write",
-    "delete_run": "run:write",
+    "delete_run": "run:delete",
     "update_run_settings": "run:write",
     "update_run_structure_from_file": "run:write",
     "list_sessions": "session:read",
@@ -109,6 +117,8 @@ def _build_capability_report(caps: dict, token_scopes: list[str]) -> dict:
 
     tool_access = {}
     for tool, scope in TOOL_SCOPES.items():
+        if HTTP_MODE and tool in _LOCAL_ONLY_TOOLS:
+            continue
         if scope not in scope_set:
             tool_access[tool] = f"blocked: requires '{scope}' scope"
         elif tool == "get_run_logs" and "session:read" not in scope_set:
@@ -127,8 +137,27 @@ def _build_capability_report(caps: dict, token_scopes: list[str]) -> dict:
     }
 
 
+# Set by http_server.configure_http_mode(): every caller brings its own formr
+# token (the connection its researcher made by signing in to formr), checked
+# by FormrTokenVerifier, and the server keeps no workspace and no credential.
+HTTP_MODE = False
+_shared_http: httpx.AsyncClient | None = None
+
+
+def shared_http() -> httpx.AsyncClient:
+    """One connection pool for every caller's requests to formr (HTTP mode).
+    It holds no caller's state: each request carries its caller's token."""
+    global _shared_http
+    if _shared_http is None:
+        _shared_http = httpx.AsyncClient(timeout=resolve_timeout())
+    return _shared_http
+
+
 @asynccontextmanager
-async def lifespan(server: FastMCP) -> AsyncIterator[FormrClient]:
+async def lifespan(server: FastMCP) -> AsyncIterator[FormrClient | None]:
+    if HTTP_MODE:
+        yield None
+        return
     err = check_credentials(BASE_URL, CLIENT_ID, CLIENT_SECRET)
     if err:
         # Logged to stderr (not print -> stdout, which would corrupt the
@@ -213,7 +242,16 @@ logsetup.install_tool_logging(mcp)
 
 
 def _client(ctx: Context) -> FormrClient:
-    return ctx.request_context.lifespan_context
+    """The formr client for this call: over stdio the one of the .env
+    credential; over HTTP one with the caller's own token, taken from this
+    very request (not the session's first: the client refreshes its token)."""
+    if not HTTP_MODE:
+        return ctx.request_context.lifespan_context
+    user = getattr(ctx.request_context.request, "user", None)
+    access = getattr(user, "access_token", None)
+    if access is None:
+        raise FormrAuthExpired("This request carries no formr connection. Connect the app to formr.")
+    return FormrClient(BASE_URL, http_client=shared_http(), access_token=access.token)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -377,6 +415,49 @@ def _unit_signature(structure: dict) -> list[tuple]:
     return sorted(sig, key=lambda x: (not isinstance(x[0], int), x[0] if isinstance(x[0], int) else 0, str(x)))
 
 
+async def _upload_structure(client: FormrClient, name: str, structure: dict) -> str:
+    """Validate a run structure and PUT it, then check what formr stored."""
+    _normalize_survey_choices(structure)
+    errors = validate_structure(structure)
+    if errors:
+        raise ValueError(
+            "Structure validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
+        )
+    await client.put_run_structure(name, structure)
+    result = await client.get_run_structure(name)
+    _verify_upload(name, structure, result)
+    units = len(result.get("units", []))
+    return f"Run '{name}': successfully updated ({units} units)."
+
+
+@asynccontextmanager
+async def _run_structure(ctx: Context, name: str, *, upload: bool = False):
+    """Over HTTP the server keeps no workspace: the run's structure is fetched
+    with the caller's token for this one call (utils.MEMORY_STRUCTURES), so
+    formr decides whether the caller may see it, and an edit is validated and
+    uploaded after (yields a list that receives the upload's message). Over
+    stdio the tools use the workspace files as before."""
+    uploaded: list[str] = []
+    if not HTTP_MODE:
+        yield uploaded
+        return
+    client = _client(ctx)
+    store = {name: await client.get_run_structure(name)}
+    fetched = store[name]
+    reset = MEMORY_STRUCTURES.set(store)
+    try:
+        yield uploaded
+    finally:
+        MEMORY_STRUCTURES.reset(reset)
+    if upload and store[name] is not fetched:
+        uploaded.append(await _upload_structure(client, name, store[name]))
+
+
+def _with_upload(result: str, uploaded: list[str]) -> str:
+    """An edit tool's answer, and over HTTP what the upload after it said."""
+    return result + (f"\n{uploaded[0]}" if uploaded else "")
+
+
 def _verify_upload(name: str, sent: dict, stored: dict) -> None:
     """formr can answer 200 for an import it rolled back (the old structure
     had the same unit count). Compare what was sent with what is stored."""
@@ -415,22 +496,12 @@ async def update_run_structure_from_file(name: RunName, ctx: Context = None) -> 
     with open(filepath, encoding="utf-8") as f:
         structure = json.load(f)
 
-    _normalize_survey_choices(structure)
-    errors = validate_structure(structure)
-    if errors:
-        raise ValueError(
-            "Structure validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
-        )
-
-    await client.put_run_structure(name, structure)
-    result = await client.get_run_structure(name)
-    _verify_upload(name, structure, result)
-    units = len(result.get("units", []))
+    message = await _upload_structure(client, name, structure)
 
     if bak_path.exists():
         bak_path.unlink()
 
-    return f"Run '{name}': successfully updated ({units} units)."
+    return message
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -465,19 +536,7 @@ async def update_run_structure(name: RunName, structure_json: str, ctx: Context 
     if not isinstance(structure, dict) or "units" not in structure:
         raise ValueError("Run structure must be a JSON object with a 'units' array.")
 
-    _normalize_survey_choices(structure)
-    errors = validate_structure(structure)
-    if errors:
-        raise ValueError(
-            "Structure validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
-        )
-
-    client = _client(ctx)
-    await client.put_run_structure(name, structure)
-    result = await client.get_run_structure(name)
-    _verify_upload(name, structure, result)
-    units = len(result.get("units", []))
-    return f"Run '{name}': successfully updated ({units} units)."
+    return await _upload_structure(_client(ctx), name, structure)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -539,23 +598,24 @@ def get_pattern(name: str, ctx: Context = None) -> dict:
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
-def summarize_run(name: RunName, detail: Literal["units", "items"] = "items", ctx: Context = None) -> str:
+async def summarize_run(name: RunName, detail: Literal["units", "items"] = "items", ctx: Context = None) -> str:
     """Summarize a run structure from the local file. Returns a readable overview of units and their items.
 
-    Must call get_run_structure_to_file(name) first to fetch the structure.
+    Locally (stdio) call get_run_structure_to_file(name) first; a hosted server reads the run from formr itself.
 
     Use detail='units' for just unit-level info (no items), or detail='items' (default) to include all survey items.
     Strips HTML from labels for readability.
     """
     validate_run_name(name)
-    return summarize_run_structure(name, detail=detail)
+    async with _run_structure(ctx, name):
+        return summarize_run_structure(name, detail=detail)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
-def find_run_items(name: RunName, query: str | None = None, item_type: str | None = None, ctx: Context = None) -> str:
+async def find_run_items(name: RunName, query: str | None = None, item_type: str | None = None, ctx: Context = None) -> str:
     """Search for items across all surveys in a run. Returns matching items with survey context.
 
-    Must call get_run_structure_to_file(name) first to fetch the structure.
+    Locally (stdio) call get_run_structure_to_file(name) first; a hosted server reads the run from formr itself.
 
     Filters:
     - query: search item names and labels (case-insensitive substring match)
@@ -563,26 +623,28 @@ def find_run_items(name: RunName, query: str | None = None, item_type: str | Non
     At least one filter is recommended; both can be combined.
     """
     validate_run_name(name)
-    return find_items(name, query=query, item_type=item_type)
+    async with _run_structure(ctx, name):
+        return find_items(name, query=query, item_type=item_type)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
-def analyze_run(name: RunName, ctx: Context = None) -> str:
+async def analyze_run(name: RunName, ctx: Context = None) -> str:
     """Analyze a run structure for errors and warnings. Checks R syntax, variable references, branch flow, item consistency, and common mistakes.
 
-    Must call get_run_structure_to_file(name) first to fetch the structure.
+    Locally (stdio) call get_run_structure_to_file(name) first; a hosted server reads the run from formr itself.
 
     Returns a structured report with error/warning counts. R syntax validation requires R to be installed.
     """
     validate_run_name(name)
-    return run_analysis(name)
+    async with _run_structure(ctx, name):
+        return run_analysis(name)
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False))
-def add_run_unit(name: RunName, unit_type: str, position: int, description: str = "",
+async def add_run_unit(name: RunName, unit_type: str, position: int, description: str = "",
                 insert_mode: Literal["shift", "overwrite"] = "shift",
                 unit_fields: dict | None = None, ctx: Context = None) -> str:
-    """Add a unit to a local run structure file. The file must exist (fetch with get_run_structure_to_file first).
+    """Add a unit to a run structure. Locally the file must exist (fetch with get_run_structure_to_file first); a hosted server edits the run in formr, validated and uploaded in one step.
 
     unit_fields — unit-type-specific fields (see get_unit_types() for full schema):
       Branch/SkipForward/SkipBackward: condition (R expr), if_true (int position)
@@ -601,57 +663,67 @@ def add_run_unit(name: RunName, unit_type: str, position: int, description: str 
     get_documentation("form-v2").
     """
     validate_run_name(name)
-    return editing_add_run_unit(name, unit_type, position, description=description,
-                               insert_mode=insert_mode, **(unit_fields or {}))
+    async with _run_structure(ctx, name, upload=True) as uploaded:
+        result = editing_add_run_unit(name, unit_type, position, description=description,
+                                      insert_mode=insert_mode, **(unit_fields or {}))
+    return _with_upload(result, uploaded)
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False, openWorldHint=False))
-def remove_run_unit(name: RunName, position: int, compact: bool = False, ctx: Context = None) -> str:
+async def remove_run_unit(name: RunName, position: int, compact: bool = False, ctx: Context = None) -> str:
     """Remove a unit at the given position from the local run structure file.
 
-    The file must exist (fetch with get_run_structure_to_file first).
-    After removing, call update_run_structure_from_file to upload.
+    Locally the file must exist (fetch with get_run_structure_to_file first); a hosted server edits the run in formr, validated and uploaded in one step.
+    Locally, call update_run_structure_from_file to upload after removing.
     compact=True shifts higher positions down by 1 and remaps references; dangling references are reported.
     """
     validate_run_name(name)
-    return editing_remove_run_unit(name, position, compact=compact)
+    async with _run_structure(ctx, name, upload=True) as uploaded:
+        result = editing_remove_run_unit(name, position, compact=compact)
+    return _with_upload(result, uploaded)
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False))
-def duplicate_run_units(name: RunName, from_positions: list[int], to_start_position: int,
+async def duplicate_run_units(name: RunName, from_positions: list[int], to_start_position: int,
                         shift_existing: bool = True, ctx: Context = None) -> str:
     """Copy units at from_positions to new positions starting at to_start_position in the local run structure file.
 
     Copies units in original order with gaps of 10 (e.g., 100, 110, 120...).
     shift_existing=True (default) shifts conflicting units up; False errors on conflicts.
-    Position references are automatically remapped. The file must exist (fetch with get_run_structure_to_file first).
+    Position references are automatically remapped. Locally the file must exist (fetch with get_run_structure_to_file first); a hosted server edits the run in formr, validated and uploaded in one step.
     """
     validate_run_name(name)
-    return editing_duplicate_run_units(name, from_positions, to_start_position,
-                                       shift_existing=shift_existing)
+    async with _run_structure(ctx, name, upload=True) as uploaded:
+        result = editing_duplicate_run_units(name, from_positions, to_start_position,
+                                             shift_existing=shift_existing)
+    return _with_upload(result, uploaded)
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False))
-def shift_run_positions(name: RunName, from_position: int, delta: int, ctx: Context = None) -> str:
+async def shift_run_positions(name: RunName, from_position: int, delta: int, ctx: Context = None) -> str:
     """Shift all units at positions >= from_position by delta in the local run structure file.
 
     Positive delta shifts up (making room), negative shifts down (closing gaps).
-    Position references are automatically remapped. The file must exist (fetch with get_run_structure_to_file first).
+    Position references are automatically remapped. Locally the file must exist (fetch with get_run_structure_to_file first); a hosted server edits the run in formr, validated and uploaded in one step.
     """
     validate_run_name(name)
-    return editing_shift_run_positions(name, from_position, delta)
+    async with _run_structure(ctx, name, upload=True) as uploaded:
+        result = editing_shift_run_positions(name, from_position, delta)
+    return _with_upload(result, uploaded)
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False))
-def renormalize_positions(name: RunName, spacing: Annotated[int, Field(ge=1)] = 10, ctx: Context = None) -> str:
+async def renormalize_positions(name: RunName, spacing: Annotated[int, Field(ge=1)] = 10, ctx: Context = None) -> str:
     """Renumber all unit positions to clean multiples of spacing while preserving order.
 
     Safe to call on already-clean structures. Position references are automatically remapped.
     Useful after edits that leave gaps (e.g., compact removal shifts by 1).
-    The file must exist (fetch with get_run_structure_to_file first).
+    Locally the file must exist (fetch with get_run_structure_to_file first); a hosted server edits the run in formr, validated and uploaded in one step.
     """
     validate_run_name(name)
-    return editing_renormalize_positions(name, spacing=spacing)
+    async with _run_structure(ctx, name, upload=True) as uploaded:
+        result = editing_renormalize_positions(name, spacing=spacing)
+    return _with_upload(result, uploaded)
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=True))
@@ -943,6 +1015,8 @@ async def upload_run_file(name: RunName, path: str | None = None, filename: str 
     if len(given) != 1:
         raise ValueError("Give exactly one of path, text or content_base64.")
     if path is not None:
+        if HTTP_MODE:
+            raise ValueError("A hosted MCP server has no workspace: pass the file's content as text or content_base64.")
         file = workspace_file(path)
         content = file.read_bytes()
         filename = filename or file.name
@@ -1011,7 +1085,49 @@ async def fetch_google_sheet(
     CSV here to inspect/convert, or grab the XLSX to upload via formr's survey
     import.
     """
+    if HTTP_MODE and (to_file or format == "xlsx"):
+        raise ValueError("A hosted MCP server has no workspace to write the sheet to: fetch it as CSV text (format='csv', to_file=False).")
     return await gsheets.fetch_google_sheet(url, format, to_file)
+
+
+# Over HTTP: tools that need the server's own workspace (each caller's files
+# would be every caller's) or send a run to a third party.
+_LOCAL_ONLY_TOOLS = ("get_run_structure_to_file", "update_run_structure_from_file", "open_flowchart")
+
+_HTTP_SETUP = """SETUP: This is a hosted formr MCP server. The user connected it to their formr
+account by signing in on formr and choosing its scopes and runs there; every call acts
+as them, with no more than that. Call whoami FIRST — it reports the connection's scopes,
+run allowlist, and which tools are usable. To change what it may do, the user edits the
+connection under Account -> API (Connected apps) in formr, or connects again; deleting it
+there ends it at once."""
+
+_HTTP_WORKFLOW = """WORKFLOW — editing run structures (this server keeps no files):
+    1. get_run_structure(name) → returns the structure as JSON text
+    2. edit that JSON in your reply
+    3. update_run_structure(name, structure_json) → validates and uploads
+  The unit tools (add_run_unit, remove_run_unit, duplicate_run_units, shift_run_positions,
+  renormalize_positions) fetch the run, edit, validate and upload it in one step; summarize_run,
+  find_run_items and analyze_run read it from formr. Upload files with upload_run_file(text=…)
+  or content_base64."""
+
+
+def configure_http_mode() -> None:
+    """Serve many researchers over HTTP (http_server.py): each request carries its
+    caller's formr token, the server keeps no workspace, and the tools that need one
+    are not offered."""
+    global HTTP_MODE
+    HTTP_MODE = True
+    for tool in _LOCAL_ONLY_TOOLS:
+        mcp.remove_tool(tool)
+    text = mcp._mcp_server.instructions
+    setup_start = text.index("SETUP:")
+    setup_end = text.index("CAPABILITIES & LIMITS:")
+    text = text[:setup_start] + _HTTP_SETUP + "\n\n" + text[setup_end:]
+    flow_start = text.index("WORKFLOW — editing run structures")
+    flow_end = text.index("PATTERNS —")
+    text = text[:flow_start] + _HTTP_WORKFLOW + "\n\n" + text[flow_end:]
+    text = text.replace("upload_run_file (from the workspace, text or base64)", "upload_run_file (text or base64)")
+    mcp._mcp_server.instructions = text
 
 
 if __name__ == "__main__":

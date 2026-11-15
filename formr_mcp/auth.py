@@ -1,8 +1,13 @@
+import hashlib
+import logging
 import time
 from dataclasses import dataclass, field
 from urllib.parse import urljoin
 
 import httpx
+from mcp.server.auth.provider import AccessToken
+
+log = logging.getLogger("formr_mcp.auth")
 
 
 class AuthError(Exception):
@@ -103,3 +108,63 @@ async def get_token(
     finally:
         if http_client is None:
             await client.aclose()
+
+
+class FormrTokenVerifier:
+    """The HTTP server's check of every bearer token a client sends: formr,
+    which issued it when its researcher connected the app, says whose it is
+    and what it may do (GET /api/v1/user/token). Only a connection's token is
+    taken (one formr issued for this MCP server: connector_client_id set), not
+    a token of a credential made for a script. Answers are kept for `ttl`
+    seconds by the token's hash, never past the token's expiry, so a connection
+    deleted in formr stops here within that time (and at formr at once).
+    """
+
+    def __init__(self, base_url: str, http_client: httpx.AsyncClient, resource: str,
+                 ttl: float = 60.0, max_entries: int = 10000):
+        self._url = urljoin(base_url.rstrip("/") + "/", "api/v1/user/token")
+        self._http = http_client
+        self._resource = resource
+        self._ttl = ttl
+        self._max_entries = max_entries
+        self._cache: dict[str, tuple[float, AccessToken]] = {}
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        key = hashlib.sha256(token.encode()).hexdigest()
+        now = time.time()
+        hit = self._cache.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+        self._cache.pop(key, None)
+        try:
+            resp = await self._http.get(self._url, headers={"Authorization": f"Bearer {token}"})
+        except httpx.HTTPError as e:
+            log.warning("token check: formr unreachable (%s)", type(e).__name__)
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            info = resp.json()
+            if not info.get("connector_client_id"):
+                log.info("token check: refused a token that is not a connection's")
+                return None
+            expires = int(info["expires"]) if info.get("expires") else None
+            access = AccessToken(
+                token=token,
+                client_id=str(info["client_id"]),
+                scopes=[str(s) for s in (info.get("scopes") or [])],
+                expires_at=expires,
+                resource=self._resource,
+                subject=str(info["account_id"]),
+                claims={"connector_client_id": info["connector_client_id"]},
+            )
+        except (ValueError, KeyError, TypeError) as e:
+            log.warning("token check: unexpected answer from formr (%s)", type(e).__name__)
+            return None
+        if len(self._cache) >= self._max_entries:
+            self._cache.clear()
+        until = now + self._ttl
+        if expires is not None:
+            until = min(until, expires)
+        self._cache[key] = (until, access)
+        return access
