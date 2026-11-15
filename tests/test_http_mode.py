@@ -100,6 +100,14 @@ class TestBearerClient:
         assert all(r.headers["Authorization"] == f"Bearer {TOKEN}" for r in seen)
         assert not any(r.url.path.endswith("access_token") for r in seen)
 
+    def test_run_ids_without_names_are_runs_still(self):
+        def handler(request):
+            return httpx.Response(200, json=_token_info(allowed_runs=[7, 9], email=None))
+        client = FormrClient(BASE, http_client=_formr(handler), access_token=TOKEN)
+        caps = _run(client.get_capabilities())
+        assert caps["allowed_runs"] == [{"id": 7, "name": "run #7"}, {"id": 9, "name": "run #9"}]
+        assert caps["email"] is None
+
 
 @pytest.fixture
 def http_mode(monkeypatch):

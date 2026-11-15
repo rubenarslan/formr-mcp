@@ -221,7 +221,9 @@ class FormrClient:
                     "email": info.get("email"),
                     "connection": info.get("label"),
                     "scopes": info.get("scopes") or [],
-                    "allowed_runs": info.get("allowed_runs"),
+                    # names only with run:read; else formr gives the ids
+                    "allowed_runs": [r if isinstance(r, dict) else {"id": r, "name": f"run #{r}"}
+                                     for r in info["allowed_runs"]] if info.get("allowed_runs") else None,
                 }
             else:
                 self._capabilities = await self.get_user_me()
