@@ -1711,34 +1711,61 @@ Each Survey unit defines its items inline as JSON objects.
 def _editing_tools():
     return r"""# Editing Tools for Run Structures
 
-## Workspace Directory
+## Two ways to work
 
-The MCP stores all run structure files in a `.formr/` directory. By default this
-is relative to the MCP server's working directory at startup, which varies by
-client (Claude Code, Cursor, OpenCode each launch from a different CWD). To pin
-it to a known absolute location, set `FORMR_WORKSPACE_DIR` in the `.env` file
-next to `server.py`:
+Which applies: on a **hosted** server (the formr instance's own, added to an app by
+its URL) the file tools `get_run_structure_to_file`, `update_run_structure_from_file`
+and `open_flowchart` are not offered; on a **local** server (run on the user's
+computer with an API credential) they are.
 
-    FORMR_WORKSPACE_DIR=/absolute/path/to/your/project/.formr
+**Hosted, or without file access** (a chat app such as Claude or ChatGPT):
 
-All tool messages (fetch, save, error) include the absolute path so you always
-know exactly where files are being read from and written to.
+1. `get_run_structure("run-name")` returns the structure as JSON text
+2. edit it in your reply, or use the programmatic editing tools below
+3. `update_run_structure("run-name", structure_json)` validates and uploads
 
-## Core Workflow: Fetch → Edit → Upload
+On a hosted server every editing tool below fetches the run from formr, edits it,
+validates it and uploads it in one call, and the inspection tools read the run
+from formr: each call changes the live run.
 
-Always use the file-based workflow. Do NOT pass large JSON structures through tool call arguments.
+**Local, with file access** (a coding agent or editor: Claude Code, Codex, Cursor,
+VS Code, OpenCode), for large runs:
 
-1. `get_run_structure_to_file("run-name")` — fetches to `.formr/run-name.json`
-2. Edit `.formr/run-name.json` with Read/Edit tools, or use the programmatic editing tools below
-3. `update_run_structure_from_file("run-name")` — validates and uploads
+1. `get_run_structure_to_file("run-name")` fetches to `.formr/run-name.json`
+2. edit that file with Read/Edit tools, or use the programmatic editing tools below
+3. `update_run_structure_from_file("run-name")` validates and uploads
 
-On success, the backup (`.formr/run-name.json.bak`) is auto-removed.
-On validation error, fix the file and retry. If stuck, restore from `.bak`.
+Locally the editing and inspection tools work on `.formr/<name>.json`: fetch it
+first. On success the backup (`.formr/run-name.json.bak`) is removed; on a
+validation error, fix the file and retry, or restore from `.bak`. The `.formr/`
+directory is relative to the server's working directory at startup, which differs
+between apps; `FORMR_WORKSPACE_DIR` in the `.env` next to `server.py` pins it, and
+every tool message names the absolute path.
+
+## Uploads keep participants in place
+
+formr (v2.0.0-rc13 and later) changes only what an upload changes:
+
+- Keep each unit's `run_unit_id` as fetched: formr keeps that unit, and its
+  participants stay on it, moving along when its position changes. Leave it out
+  for a new unit and never copy it to another (`duplicate_run_units` drops it).
+- Keep the structure's `version`: formr refuses an upload made from a copy that
+  changed in formr meanwhile. Fetch again and redo the change then.
+- A unit left out is removed, and its participants go on to whatever now stands
+  in its place. Where real participants are at it, formr refuses unless the call
+  passes `confirm_removal=true` (`remove_run_unit`, `update_run_structure`,
+  `update_run_structure_from_file`): name the units to the user and pass it only
+  with their go-ahead.
+- A survey's items are saved only where they differ from the survey's own, and
+  that needs the `survey:write` scope.
+
+An older formr (no `run_unit_id` in the structure) replaces every unit on each
+upload and restarts every participant's current step: make all changes in one
+upload there, and tell the user first.
 
 ## Programmatic Editing Tools
 
 For systematic changes, use the editing tools instead of manual JSON edits.
-All editing tools operate on `.formr/<name>.json` directly. Call `get_run_structure_to_file` first to ensure the file exists.
 
 ### add_run_unit
 
@@ -1763,10 +1790,11 @@ Common kwargs by unit type:
 ### remove_run_unit
 
 ```
-remove_run_unit(name, position, compact=False)
+remove_run_unit(name, position, compact=False, confirm_removal=False)
 ```
 
-Remove a unit at the given position. If `compact=True`, shifts all units at higher positions down by **1** to fill the gap. Position references are automatically updated when compacting. Dangling references to the removed position are detected and reported as warnings.
+Remove a unit at the given position. formr refuses it while real participants are
+at that unit unless `confirm_removal=True`, which only the user's go-ahead justifies. If `compact=True`, shifts all units at higher positions down by **1** to fill the gap. Position references are automatically updated when compacting. Dangling references to the removed position are detected and reported as warnings.
 
 **Note**: Compact shifts by 1, not by the original spacing. This means removing position 20 from `[10, 20, 30]` produces `[10, 29]`, not `[10, 20]`. Use `renormalize_positions` afterwards to clean up to clean multiples of 10.
 
@@ -1810,17 +1838,17 @@ Safe to call on already-clean structures — if positions are already at clean m
 To create or modify items in a Survey unit's `survey_data`, use the JSON format
 documented in `get_documentation("survey-json")` (structure, fields, choices, page
 breaks, CSS classes) together with `get_documentation("item-types")` (all 62 item
-types, choices rules, type_options). Edit the `.formr/<name>.json` file directly
-with Read/Edit tools after fetching it with `get_run_structure_to_file`.
+types, choices rules, type_options). Edit the unit's `survey_data` in the fetched
+structure (the JSON text, or `.formr/<name>.json` locally) and upload it.
 
 ## Read-Only Inspection Tools
 
-These tools read from the local `.formr/<name>.json` file (call `get_run_structure_to_file` first):
+These tools read the run from formr on a hosted server, and from `.formr/<name>.json` locally (call `get_run_structure_to_file` first):
 
 - **`summarize_run(name, detail)`** — human-readable overview. `detail="units"` for unit-level only, `detail="items"` (default) to include all survey items. Strips HTML from labels.
 - **`find_run_items(name, query?, item_type?)`** — search items by name/label substring and/or item type (e.g. `"mc"`, `"text"`, `"calculate"`).
-- **`analyze_run(name)`** — check for structural errors: R syntax validation, variable references, branch flow, Page/Endpage blocking, Wait body validation, item consistency, and common mistakes.
-- **`open_flowchart(name)`** — upload the local run structure to the formr Flowchart Generator and open an interactive flowchart in the browser. Returns a shareable URL (expires after 24 hours). Use this to show the user a quick, intuitive overview of what was built — position flow, branches, and unit types at a glance.
+- **`analyze_run(name)`** — check for structural errors: R syntax validation (where R is installed: not on a hosted server), variable references, branch flow, Page/Endpage blocking, Wait body validation, item consistency, and common mistakes.
+- **`open_flowchart(name)`** (local only) — upload the local run structure to the formr Flowchart Generator and open an interactive flowchart in the browser. Returns a shareable URL (expires after 24 hours). Use this to show the user a quick, intuitive overview of what was built — position flow, branches, and unit types at a glance.
 
 ## Position Management
 
@@ -2526,7 +2554,7 @@ pattern gives you the *approach*; you build the units adapted to the run with th
 2. `get_pattern("<name>")` to read the structure, the R idioms, and the gotchas.
 3. Build the units yourself (add_run_unit / Edit), reusing the `key_r` snippets and renaming to
    the run's real survey/item names.
-4. `analyze_run` then `update_run_structure_from_file`.
+4. `analyze_run`, then `update_run_structure` (or `update_run_structure_from_file` locally).
 
 ## Available patterns
 

@@ -1,5 +1,6 @@
 """Streamable-HTTP entrypoint for formr-mcp: one server for every researcher
-of a formr instance, who adds it to Claude by its URL.
+of a formr instance, who adds it to their AI app (Claude, Claude Code,
+ChatGPT, Codex, VS Code) by its URL.
 
 formr is the OAuth authorization server (formr's OAuthConnectors): a client
 without a token gets a 401 naming this server's protected resource metadata

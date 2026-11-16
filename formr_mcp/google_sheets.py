@@ -1,6 +1,6 @@
 """Fetch public Google Sheets as CSV or XLSX.
 
-Claude Desktop can't turn a Google Sheets share link into the export URL it
+A chat app can't turn a Google Sheets share link into the export URL it
 needs, so this module canonicalises any sheet link into the right `/export`
 (or published `/pub`) endpoint and fetches it. CSV can be returned as text —
 the useful mode when there is no filesystem connector — while XLSX is binary

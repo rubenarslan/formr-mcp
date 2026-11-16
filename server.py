@@ -252,11 +252,12 @@ execution flows by position number. Branching uses R expressions in
 `condition` and jumps to the `if_true` position.
 
 WORKFLOW — editing run structures, two paths:
-  With filesystem access (Claude Code / editors) — preferred, best for large runs:
+  With filesystem access (a coding agent or editor: Claude Code, Codex, Cursor, VS Code)
+  — preferred, best for large runs:
     1. get_run_structure_to_file(name) → .formr/<name>.json (backs up existing)
     2. edit .formr/<name>.json with Read/Edit
     3. update_run_structure_from_file(name) → validates and uploads
-  Without filesystem access (e.g. Claude Desktop) — inline JSON text:
+  Without filesystem access (a chat app such as Claude or ChatGPT) — inline JSON text:
     1. get_run_structure(name) → returns the structure as JSON text
     2. edit that JSON in your reply
     3. update_run_structure(name, structure_json) → validates and uploads
@@ -674,8 +675,8 @@ async def update_run_structure_from_file(name: RunName, confirm_removal: bool = 
 async def get_run_structure(name: RunName, ctx: Context = None) -> str:
     """Fetch a run's full structure and return it as JSON text (NOT written to a file).
 
-    Use this when you don't have filesystem access — e.g. Claude Desktop without a
-    filesystem connector. Edit the returned JSON inline, then push it back with
+    Use this when you don't have filesystem access — e.g. a chat app such as Claude
+    or ChatGPT. Edit the returned JSON inline, then push it back with
     update_run_structure. For editor/CLI workflows with file access, prefer
     get_run_structure_to_file + update_run_structure_from_file (better for large runs).
     """
@@ -1252,7 +1253,7 @@ async def fetch_google_sheet(
 ) -> str:
     """Fetch a Google Sheet by its share/edit link as CSV or XLSX.
 
-    Claude Desktop can't convert a Google Sheets link into the CSV/XLSX export
+    A chat app can't convert a Google Sheets link into the CSV/XLSX export
     URL itself — this tool does that canonicalisation and fetches the data. Pass
     any sheet link: .../spreadsheets/d/<ID>/edit#gid=<GID>, a sharing link, or a
     published /d/e/... link. The gid (tab) is honored for CSV.
