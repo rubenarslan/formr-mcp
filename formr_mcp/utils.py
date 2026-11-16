@@ -23,6 +23,20 @@ WORKSPACE_DIR = Path(_env_workspace) if _env_workspace else Path(".formr")
 VALID_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{2,255}$")
 
 
+# formr's SurveyStudy::NAME_PATTERN: a survey is named after its file, so
+# underscores, not hyphens, and at most 65 characters
+VALID_SURVEY_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{2,64}\Z")
+
+
+def validate_survey_name(name: str) -> None:
+    """Validate a survey name as formr does. Raises ValueError if invalid."""
+    if not isinstance(name, str) or not VALID_SURVEY_NAME.match(name):
+        raise ValueError(
+            f"Invalid survey name {name!r}. A survey's name starts with a letter and has "
+            f"only letters, digits and underscores, 3-65 characters."
+        )
+
+
 def validate_run_name(name: str) -> None:
     """Validate a run name. Raises ValueError if invalid.
 

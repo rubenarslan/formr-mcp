@@ -210,6 +210,8 @@ class FormrTokenVerifier:
         else FormrUnavailable."""
         if hit is not None and hit[1].expires_at and hit[1].expires_at > now:
             log.warning("token check: formr unavailable (%s), its last answer is used", why)
+            # for another while: the next request would wait on formr as long again
+            self._cache[key] = (min(now + self._ttl, hit[1].expires_at), hit[1])
             return hit[1]
         log.warning("token check: formr unavailable (%s)", why)
         raise FormrUnavailable(f"formr is not answering ({why}); try again shortly.")

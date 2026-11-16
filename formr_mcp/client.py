@@ -28,7 +28,7 @@ def resolve_timeout() -> httpx.Timeout:
         seconds = 60.0
     return httpx.Timeout(seconds, connect=min(10.0, seconds))
 
-from formr_mcp.utils import validate_run_name
+from formr_mcp.utils import validate_run_name, validate_survey_name
 from .auth import AuthError, OAuthToken, get_token
 
 
@@ -46,6 +46,15 @@ class FormrPermissionError(FormrClientError):
     authorized for the run/survey. Carries an actionable hint so the
     model can explain the limit instead of surfacing a raw status code."""
     pass
+
+
+class FormrConflict(FormrClientError):
+    """A 409 from formr. `body` is its JSON answer: a structure upload that
+    would remove units participants are in names them (units_in_use)."""
+
+    def __init__(self, message: str, body: dict | None = None):
+        super().__init__(message)
+        self.body = body or {}
 
 
 def _segment(value: str) -> str:
@@ -158,6 +167,13 @@ class FormrClient:
             return None
         if resp.status_code == 403:
             raise FormrPermissionError(self._permission_message(method, path, resp))
+        if resp.status_code == 409:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = None
+            raise FormrConflict(f"{method} {path} -> 409: {resp.text[:500]}",
+                                body if isinstance(body, dict) else None)
         if not resp.is_success:
             body = resp.text[:500]
             raise FormrClientError(
@@ -174,7 +190,7 @@ class FormrClient:
         return await self.request("GET", "api/v1/surveys", params=params)
 
     async def get_survey(self, name: str, format: str = "json") -> Any:
-        validate_run_name(name)
+        validate_survey_name(name)
         return await self.request(
             "GET", f"api/v1/surveys/{_segment(name)}", params={"format": format}
         )
@@ -191,10 +207,13 @@ class FormrClient:
         validate_run_name(name)
         return await self.request("GET", f"api/v1/runs/{_segment(name)}/structure")
 
-    async def put_run_structure(self, name: str, structure: dict) -> dict:
+    async def put_run_structure(self, name: str, structure: dict, confirm_removal: bool = False) -> dict:
+        """formr keeps the units sent back with their run_unit_id; removing
+        units participants are in is a 409 (FormrConflict) unless confirmed."""
         validate_run_name(name)
         return await self.request(
-            "PUT", f"api/v1/runs/{_segment(name)}/structure", json=structure
+            "PUT", f"api/v1/runs/{_segment(name)}/structure", json=structure,
+            params={"confirm_removal": 1} if confirm_removal else None,
         )
 
     async def create_run(self, name: str) -> dict:

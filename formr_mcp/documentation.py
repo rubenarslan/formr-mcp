@@ -67,7 +67,7 @@ def get_documentation(topic: str, section: str | None = None) -> str:
 
 # ── Item types ──────────────────────────────────────────────────────
 
-@_topic("item-types", "All 59 survey item types with fields")
+@_topic("item-types", "All 62 survey item types with fields")
 def _item_types():
     return r"""# Survey Item Types
 
@@ -231,6 +231,19 @@ Choices: **Forbidden**.
 | `add_to_home_screen` | VARCHAR(20) | **Required** | Button to add PWA to home screen. |
 | `push_notification` | TEXT | **Required** | Button to request push permission. Stores subscription JSON. |
 | `request_cookie` | VARCHAR(20) | **Required** | Button for functional cookie consent. |
+
+## Recording items: `data_quality`, `agent_probe`, `turnstile`
+
+- **`data_quality`** — a hidden field the participant's browser fills with the page's
+  automation and carelessness indicators (counts, durations) as one JSON object. Always
+  optional, gates nothing. One per page, before its submit; never on a consent page.
+- **`agent_probe`** — a note and a text field addressed to AI agents, hidden from people
+  (clipped to a pixel, out of the tab order). Any stored answer means something read the
+  page's text. `label` is the question, `choice1` the note.
+- **`turnstile`** — what Cloudflare Turnstile thinks of the participant (form_v2 only, and
+  only where the instance's administrator set up a widget for the mode): `turnstile`
+  (invisible, records), `turnstile non_interactive` (records; add `visible` to show it),
+  `turnstile managed` (a gate, unless optional).
 
 ## Bot check (form_v2)
 
@@ -1743,7 +1756,7 @@ Common kwargs by unit type:
 - **Pause/Wait**: `wait_minutes`, `wait_until_time` ("HH:MM:SS"), `wait_until_date` ("YYYY-MM-DD"), `relative_to` (R expr), `body`
 - **Wait**: `body` is an integer position for click-through (NOT display content)
 - **Survey**: `study_id` (int) or `survey_data` (dict with name, items, settings)
-- **Form**: `study_id` (int) — the form_v2 renderer for an existing study. Creating the unit sets that study's `rendering_mode='v2'`. See `get_documentation("form-v2")`; the export does **not** round-trip the study link, so re-uploading a fetched structure re-sends `study_id` only if you keep it in the file yourself.
+- **Form**: `study_id` (int) — a study rendered by form_v2. The study's own `rendering_mode` decides whether the unit is a Survey or a Form; placing it changes neither. See `get_documentation("form-v2")`.
 - **Endpage/Page**: `body` (markdown/knitr content)
 - **External**: `address` (URL or R code), `api_end` (0/1)
 
@@ -1796,7 +1809,7 @@ Safe to call on already-clean structures — if positions are already at clean m
 
 To create or modify items in a Survey unit's `survey_data`, use the JSON format
 documented in `get_documentation("survey-json")` (structure, fields, choices, page
-breaks, CSS classes) together with `get_documentation("item-types")` (all 56 item
+breaks, CSS classes) together with `get_documentation("item-types")` (all 62 item
 types, choices rules, type_options). Edit the `.formr/<name>.json` file directly
 with Read/Edit tools after fetching it with `get_run_structure_to_file`.
 
@@ -2643,24 +2656,17 @@ same `survey_items` / results tables, same run flow.
 
 ## The `Form` unit
 
-`Form` is a real run unit type (PHP `RunUnit\Form extends RunUnit\Survey`), and
-it identifies its study **differently from `Survey`**:
-
-- A `Survey` unit *shares its primary key* with the `survey_studies` row —
-  `survey_run_units.unit_id` is the study id.
-- A `Form` unit keeps **its own** `survey_units` row (`type='Form'`) and points
-  at the study through **`survey_units.form_study_id`**.
-  `survey_run_units.unit_id` stays pointed at the Form's own row.
-
-Creating a Form unit with a `study_id` also stamps `rendering_mode='v2'` on that
-study.
+A `Form` unit is a Survey unit whose study renders on v2 (`rendering_mode='v2'`). Like a
+`Survey`, it shares its study's primary key: `survey_run_units.unit_id` is the study id.
+The study's own unit row says which it is (`Form` while the study is on v2, `Survey`
+otherwise), so placing a study changes neither its engine nor its items.
 
 ### Creating one
 
-`add_run_unit(name, "Form", position, unit_fields={"study_id": <id>})`, then
-`update_run_structure_from_file`. The API accepts it — `Form` is in the PHP
-`RunUnit::SupportedUnits` list, and the structure-import path passes `study_id`
-straight through to `Form::create`.
+- `add_run_unit(name, "Form", position, unit_fields={"study_id": <id>})` places a study you
+  have. It shows as a Form if that study is on v2, else as a Survey.
+- With `survey_data` (name, items, settings) instead, formr creates the survey, on v2
+  unless its settings say otherwise.
 
 ```json
 {
@@ -2671,26 +2677,12 @@ straight through to `Form::create`.
 }
 ```
 
-Inline `survey_data` is **not** a reliable way to create a Form: the study it
-creates goes through the plain `Survey` path and comes back `rendering_mode='v1'`,
-leaving you a v2 unit pointing at a v1 study. Create/upload the survey first
-(admin UI or `/admin/survey`), then reference it by `study_id`.
+## Uploads round-trip a Form
 
-## ⚠️ The export does not round-trip a Form's study link
-
-`get_run_structure_to_file` returns a Form unit as **only**
-`{type, description, position, special}` — no `study_id`, no `survey_data`.
-(`Run::export` attaches `survey_data` only when `type === 'Survey'`, and
-`study_id` is not in the unit's export attributes.)
-
-`update_run_structure_from_file` **replaces every unit in the run**. So a plain
-fetch → edit-something-else → upload silently rebuilds the Form unit with no
-study attached, and participants hit an empty unit.
-
-**Rule: after fetching a structure that contains a `Form` unit, re-add its
-`"study_id"` in the local `.formr/<run>.json` before uploading.** Note the study
-ids somewhere first — the export won't remind you. Same caution applies to
-`duplicate_run_units` on a Form.
+A fetched structure carries each Form's `survey_data` and, from formr v2.0.0-rc13, its
+`run_unit_id`. Send both back unchanged and the unit stays as it is, with its participants:
+formr imports a survey's items only where they differ from the survey's own. A unit sent
+with its `run_unit_id` but another `study_id` or survey is a new unit.
 
 ## Per-study v2 settings
 

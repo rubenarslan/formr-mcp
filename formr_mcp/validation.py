@@ -78,6 +78,7 @@ KNOWN_ITEM_TYPES = {
     "file", "image", "audio", "video",
     "geopoint", "color",
     "request_phone", "add_to_home_screen", "push_notification", "request_cookie",
+    "data_quality", "agent_probe", "turnstile",
     "bot_check",
 }
 
@@ -255,13 +256,9 @@ def validate_survey_data(survey_data: object, unit_label: str) -> list[str]:
         errors.append(f"{unit_label}: 'survey_data.settings' must be a JSON object")
 
     if isinstance(settings, dict):
-        use_paging = settings.get("use_paging")
-        if use_paging is not None and use_paging != 0:
-            errors.append(
-                f"{unit_label}: 'use_paging' must be 0 or omitted. "
-                f"Custom Paging is legacy and unsupported — "
-                f"use 'submit' items in the item list to create page breaks."
-            )
+        # use_paging (0/1) is formr's own: a survey that pages comes back with
+        # it, and a run that has one must stay editable. Page breaks are
+        # 'submit' items (documentation), not this.
         if "page_items" in settings:
             errors.append(
                 f"{unit_label}: 'page_items' is not supported. "
@@ -284,6 +281,7 @@ def validate_structure(data: dict) -> list[str]:
 
     units = data["units"]
     positions = {}
+    placements: dict[int, int] = {}
 
     for i, unit in enumerate(units):
         if not isinstance(unit, dict):
@@ -327,6 +325,23 @@ def validate_structure(data: dict) -> list[str]:
             positions[pos] = unit_type
             positions[f"_{pos}"] = i
 
+        # formr's key for the placement (get_run_structure gives it): sent
+        # back, the unit stays in place with its participants
+        if "run_unit_id" in unit:
+            run_unit_id = unit["run_unit_id"]
+            if not isinstance(run_unit_id, int) or isinstance(run_unit_id, bool) or run_unit_id < 1:
+                errors.append(
+                    f"Unit '{unit_type}' at position {pos}: 'run_unit_id' must be the integer "
+                    f"get_run_structure gave it; leave it out for a new unit"
+                )
+            elif run_unit_id in placements:
+                errors.append(
+                    f"Unit '{unit_type}' at position {pos}: run_unit_id {run_unit_id} is also the "
+                    f"unit's at index {placements[run_unit_id]}. A copy is a new unit: leave its run_unit_id out"
+                )
+            else:
+                placements[run_unit_id] = i
+
         if unit_type in BRANCH_TYPES:
             if_true = unit.get("if_true")
             if if_true is not None and (
@@ -364,7 +379,7 @@ def validate_structure(data: dict) -> list[str]:
             # page for them
             body = unit.get("body")
             target = body if isinstance(body, int) and not isinstance(body, bool) else (
-                int(body.strip()) if isinstance(body, str) and body.strip().isdigit() else None)
+                int(body.strip()) if isinstance(body, str) and body.strip().isascii() and body.strip().isdigit() else None)
             if target is not None and target not in positions:
                 errors.append(
                     f"Wait unit at position {pos}: 'body'={body!r} (where a participant who "

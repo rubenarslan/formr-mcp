@@ -263,6 +263,21 @@ class TestDuplicateRunUnits:
         assert structure["units"][1]["position"] == 100
         assert "copy" in structure["units"][1]["description"]
 
+    def test_a_unit_copied_ahead_of_itself_keeps_the_order(self, run_file):
+        _write_run(run_file, [{"type": "Pause", "position": p, "description": f"u{p}"} for p in (10, 20, 25, 30, 40)])
+        duplicate_run_units("test-run", [25], 20)
+        units = _read_run(run_file)["units"]
+        assert [u["description"] for u in units] == ["u10", "copy: u25", "u20", "u25", "u30", "u40"]
+        assert len({u["position"] for u in units}) == len(units), "no two at one position"
+
+    def test_a_copy_has_no_run_unit_id(self, run_file):
+        # formr keeps the unit a run_unit_id names: a copy that kept it would be the original
+        _write_run(run_file, [{"type": "Pause", "position": 10, "description": "wait", "run_unit_id": 55}])
+        duplicate_run_units("test-run", [10], 100)
+        original, copy = _read_run(run_file)["units"]
+        assert original["run_unit_id"] == 55
+        assert "run_unit_id" not in copy
+
     def test_duplicate_multiple_units(self, run_file):
         _write_run(run_file, [
             {"type": "Pause", "position": 30, "description": "wait", "wait_minutes": 90},

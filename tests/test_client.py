@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from formr_mcp.client import FormrClient, FormrClientError, resolve_timeout
+from formr_mcp.client import FormrClient, FormrClientError, FormrConflict, resolve_timeout
 
 
 class TestHttpTimeout:
@@ -68,3 +68,36 @@ class TestHttpTimeout:
             msg = str(e)
         assert "database lock" in msg and "FORMR_HTTP_TIMEOUT" in msg
         asyncio.run(http.aclose())
+
+
+class TestStructureUpload:
+    def _client(self, monkeypatch, handler):
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = FormrClient("https://x.example.org", "cid", "secret", http_client=http)
+
+        async def fake_token():
+            return "tok"
+        monkeypatch.setattr(client, "_ensure_token", fake_token)
+        return client
+
+    def test_confirm_removal_goes_in_the_query(self, monkeypatch):
+        seen = []
+
+        def handler(request):
+            seen.append(str(request.url))
+            return httpx.Response(200, json={"units_imported": 1, "kept": 1})
+        client = self._client(monkeypatch, handler)
+        asyncio.run(client.put_run_structure("my-run", {"units": []}))
+        asyncio.run(client.put_run_structure("my-run", {"units": []}, confirm_removal=True))
+        assert seen == ["https://x.example.org/api/v1/runs/my-run/structure",
+                        "https://x.example.org/api/v1/runs/my-run/structure?confirm_removal=1"]
+
+    def test_a_409_carries_formrs_answer(self, monkeypatch):
+        in_use = [{"run_unit_id": 8, "position": 10, "type": "Page", "participants": 2}]
+
+        def handler(request):
+            return httpx.Response(409, json={"message": "would remove", "units_in_use": in_use})
+        client = self._client(monkeypatch, handler)
+        with pytest.raises(FormrConflict) as refused:
+            asyncio.run(client.put_run_structure("my-run", {"units": []}))
+        assert refused.value.body["units_in_use"] == in_use

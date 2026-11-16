@@ -164,7 +164,14 @@ def add_run_unit(name: str, unit_type: str, position: int, **kwargs) -> str:
     shifted = False
     if position in existing_positions:
         if insert_mode == "overwrite":
+            replaced = [u for u in units if u.get("position") == position]
             units = [u for u in units if u.get("position") != position]
+            # the same kind of unit, changed: formr saves it in place, and
+            # whoever is at it stays (another type is a new unit)
+            same = {"Endpage": "Page"}
+            if (replaced and "run_unit_id" in replaced[0]
+                    and same.get(replaced[0].get("type"), replaced[0].get("type")) == same.get(unit_type, unit_type)):
+                unit["run_unit_id"] = replaced[0]["run_unit_id"]
         elif insert_mode == "shift":
             position_map = {}
             for u in units:
@@ -281,7 +288,6 @@ def duplicate_run_units(name: str, from_positions: list[int], to_start_position:
         new_positions.append(to_start_position + (i * 10))
 
     # Build mapping from source positions to new positions (for internal remap)
-    source_set = set(from_positions)
     source_to_dest: dict[int, int] = {}
     for src_pos, new_pos in zip(sorted(from_positions), new_positions):
         source_to_dest[src_pos] = new_pos
@@ -297,7 +303,9 @@ def duplicate_run_units(name: str, from_positions: list[int], to_start_position:
             shift_by = max(new_positions) - min(conflicts) + 10
             for u in units:
                 p = u.get("position")
-                if isinstance(p, int) and p >= min(conflicts) and p not in source_set:
+                # the originals too: copied ahead of themselves, they keep
+                # their order behind the copies
+                if isinstance(p, int) and p >= min(conflicts):
                     shift_map[p] = p + shift_by
                     u["position"] = p + shift_by
     else:
@@ -315,6 +323,8 @@ def duplicate_run_units(name: str, from_positions: list[int], to_start_position:
     for src, new_pos in zip(source_units, new_positions):
         new_unit = copy.deepcopy(src)
         new_unit["position"] = new_pos
+        # a copy is a new unit: formr would take it for the original
+        new_unit.pop("run_unit_id", None)
         # Add "copy" prefix to description to distinguish from originals
         # But don't stack "copy:" prefixes on re-duplication
         if "description" in new_unit and new_unit["description"]:

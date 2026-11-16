@@ -167,6 +167,18 @@ class TestCapabilityReport:
         both = server_mod._build_capability_report({"scopes": ["run:read", "run:write"]}, [])["tool_access"]
         assert both["add_run_unit"] == "available" and both["update_run_structure"] == "available"
 
+    def test_a_tool_that_also_reads_needs_that_scope_too(self, monkeypatch):
+        # without it the write lands, then the tool fails, and a retry writes again
+        monkeypatch.setenv("FORMR_DATA_ACCESS", "test_only")
+        access = server_mod._build_capability_report(
+            {"scopes": ["session:write", "file:write"]}, [])["tool_access"]
+        assert access["create_test_sessions"] == "blocked: requires 'run:read' and 'session:write' scopes"
+        assert access["upload_run_file"] == "blocked: requires 'file:read' and 'file:write' scopes"
+        assert access["test_session_action"].startswith("blocked: requires 'session:read'")
+        both = server_mod._build_capability_report(
+            {"scopes": ["session:write", "session:read", "run:read"]}, [])["tool_access"]
+        assert both["create_test_sessions"] == "available" and both["test_session_action"] == "available"
+
     def test_falls_back_to_token_scopes(self, monkeypatch):
         # Old formr without the user/me capability fields: scopes come from token.
         monkeypatch.setenv("FORMR_DATA_ACCESS", "all")

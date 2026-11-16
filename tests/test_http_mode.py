@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import server as server_mod
 from formr_mcp import utils
 from formr_mcp.auth import FormrTokenVerifier, FormrUnavailable
-from formr_mcp.client import FormrAuthExpired, FormrClient
+from formr_mcp.client import FormrAuthExpired, FormrClient, FormrClientError, FormrConflict
 
 BASE = "https://formr.example.org"
 MCP_URL = BASE + "/mcp"
@@ -87,6 +87,23 @@ class TestTokenVerifier:
         access = _run(verifier.verify_token(TOKEN))
         up[0] = False
         assert _run(verifier.verify_token(TOKEN)) == access
+
+    def test_while_formr_hangs_one_request_waits_not_every_one(self):
+        calls = []
+        up = [True]
+
+        def handler(request):
+            calls.append(1)
+            if not up[0]:
+                raise httpx.ReadTimeout("hangs")
+            return httpx.Response(200, json=_token_info())
+        verifier = FormrTokenVerifier(BASE, _formr(handler), resource=MCP_URL, ttl=60)
+        access = _run(verifier.verify_token(TOKEN))
+        verifier._cache[verifier._key(TOKEN)] = (0, access)  # the minute is over
+        up[0] = False
+        assert _run(verifier.verify_token(TOKEN)) == access
+        assert _run(verifier.verify_token(TOKEN)) == access
+        assert len(calls) == 2, "the stale answer stands for another minute"
 
     @pytest.mark.parametrize("response", [
         httpx.Response(200, json=None),
@@ -192,7 +209,7 @@ class TestNoWorkspace:
         async def get(name):
             return json.loads(json.dumps(stored[name]))
 
-        async def put(name, structure):
+        async def put(name, structure, confirm_removal=False):
             stored[name] = json.loads(json.dumps(structure))
         c.get_run_structure.side_effect = get
         c.put_run_structure.side_effect = put
@@ -219,7 +236,7 @@ class TestNoWorkspace:
         assert utils.MEMORY_STRUCTURES.get() is None, "nothing kept after the call"
 
     def test_an_edit_that_changes_nothing_uploads_nothing(self, http_mode):
-        # formr's upload replaces the run and expires its participants' unit sessions
+        # an upload costs a round trip and, on an older formr, every participant's step
         c = self._client(http_mode)
         out = _run(server_mod.renormalize_positions("demo", ctx=MagicMock()))
         assert "already clean" in out and "nothing was uploaded" in out
@@ -243,6 +260,100 @@ class TestNoWorkspace:
         _run(both())
         stored = _run(c.get_run_structure("demo"))
         assert sorted(u["position"] for u in stored["units"]) == [3, 6, 10]
+
+    def test_a_removal_is_confirmed_only_when_asked(self, http_mode):
+        c = self._client(http_mode, {"name": "demo", "units": [
+            {"type": "Pause", "position": 5, "wait_minutes": 1, "run_unit_id": 7},
+            {"type": "Pause", "position": 6, "wait_minutes": 1, "run_unit_id": 9},
+            {"type": "Endpage", "position": 10, "body": "Bye", "run_unit_id": 8}]})
+        _run(server_mod.add_run_unit("demo", "Pause", 3, unit_fields={"wait_minutes": 1}, ctx=MagicMock()))
+        assert c.put_run_structure.await_args.kwargs["confirm_removal"] is False
+        # as formr's editor asks first: the user hears of participants before they are moved on
+        _run(server_mod.remove_run_unit("demo", 5, ctx=MagicMock()))
+        assert c.put_run_structure.await_args.kwargs["confirm_removal"] is False
+        sent = c.put_run_structure.await_args.args[1]
+        assert [u.get("run_unit_id") for u in sent["units"]] == [None, 9, 8], "the kept units keep their ids"
+        _run(server_mod.remove_run_unit("demo", 3, confirm_removal=True, ctx=MagicMock()))
+        assert c.put_run_structure.await_args.kwargs["confirm_removal"] is True
+
+    def test_overwriting_a_unit_with_one_of_its_type_keeps_it(self, http_mode):
+        c = self._client(http_mode, {"name": "demo", "units": [
+            {"type": "Pause", "position": 5, "wait_minutes": 1, "run_unit_id": 7},
+            {"type": "Endpage", "position": 10, "body": "Bye", "run_unit_id": 8}]})
+        _run(server_mod.add_run_unit("demo", "Pause", 5, insert_mode="overwrite",
+                                     unit_fields={"wait_minutes": 120}, ctx=MagicMock()))
+        pause = c.put_run_structure.await_args.args[1]["units"][0]
+        assert (pause["run_unit_id"], pause["wait_minutes"]) == (7, 120)
+        _run(server_mod.add_run_unit("demo", "Page", 10, insert_mode="overwrite",
+                                     unit_fields={"body": "Hi"}, ctx=MagicMock()))
+        assert c.put_run_structure.await_args.args[1]["units"][1]["run_unit_id"] == 8, "a Page is an Endpage"
+        _run(server_mod.add_run_unit("demo", "External", 5, insert_mode="overwrite",
+                                     unit_fields={"address": "https://example.org"}, ctx=MagicMock()))
+        assert "run_unit_id" not in c.put_run_structure.await_args.args[1]["units"][0], "another type is a new unit"
+
+    def test_a_removal_formr_refuses_names_the_units_and_asks_first(self, http_mode):
+        c = self._client(http_mode)
+        c.put_run_structure.side_effect = FormrConflict("PUT ... -> 409", {
+            "message": "...", "units_in_use": [{"run_unit_id": 8, "position": 10, "type": "Page", "participants": 3}]})
+        upload = lambda: _run(server_mod.update_run_structure("demo", json.dumps({"units": [
+            {"type": "Pause", "position": 5, "wait_minutes": 1}]}), ctx=MagicMock()))
+        with pytest.raises(ValueError) as refused:
+            upload()
+        assert "nothing was uploaded" in str(refused.value)
+        assert "Page at position 10;" in str(refused.value) or str(refused.value).count("Page at position 10") == 1
+        assert "participant(s)" not in str(refused.value), "how many: real participants' data, under test_only"
+        assert "only with their go-ahead, upload again with confirm_removal=true" in str(refused.value)
+        http_mode.setenv("FORMR_DATA_ACCESS", "all")
+        with pytest.raises(ValueError) as refused:
+            upload()
+        assert "Page at position 10 (3 participant(s))" in str(refused.value)
+
+    def test_an_upload_made_from_an_old_copy_says_fetch_again(self, http_mode):
+        c = self._client(http_mode)
+        c.put_run_structure.side_effect = FormrConflict("PUT ... -> 409", {"message": "...", "version": "abc"})
+        with pytest.raises(ValueError, match="has changed in formr since it was fetched"):
+            _run(server_mod.update_run_structure("demo", json.dumps({"version": "old", "units": [
+                {"type": "Pause", "position": 5, "wait_minutes": 1}]}), ctx=MagicMock()))
+
+    def test_a_change_formr_applied_is_not_reported_as_failed(self, http_mode):
+        c = self._client(http_mode)
+        c.get_run_structure.side_effect = [json.loads(json.dumps(self.STRUCTURE)),
+                                           FormrClientError("GET ... timed out")]
+        with pytest.raises(ValueError, match="formr applied the upload .* Do not repeat the change"):
+            _run(server_mod.add_run_unit("demo", "Pause", 5, unit_fields={"wait_minutes": 1}, ctx=MagicMock()))
+
+    def test_the_answer_says_what_formr_did(self, monkeypatch):
+        answer = {"units_imported": 3, "kept": 2, "moved": 1, "created": 1,
+                  "removed": 0, "participants_moved": 4, "steps_ended": 0}
+        monkeypatch.setenv("FORMR_DATA_ACCESS", "all")
+        merged = server_mod._merge_summary(answer)
+        assert merged.startswith("Kept 2 unit(s) in place (1 moved), created 1, removed 0.")
+        assert "4 participant(s) moved along with their unit" in merged
+        monkeypatch.delenv("FORMR_DATA_ACCESS")
+        assert "Participants moved along with their unit" in server_mod._merge_summary(answer)
+        assert "replaced the whole structure" in server_mod._merge_summary({"units_imported": 3})
+        assert "replaced the whole structure" in server_mod._merge_summary(None)
+
+    def test_formrs_warnings_reach_the_model(self, http_mode):
+        c = self._client(http_mode)
+        put = c.put_run_structure.side_effect
+
+        async def put_warning(name, structure, confirm_removal=False):
+            await put(name, structure, confirm_removal)
+            return {"units_imported": 2, "kept": 1, "created": 1, "warnings": "The expiry date cannot be set to a past date."}
+        c.put_run_structure.side_effect = put_warning
+        out = _run(server_mod.add_run_unit("demo", "Pause", 5, unit_fields={"wait_minutes": 1}, ctx=MagicMock()))
+        assert "formr says: The expiry date cannot be set to a past date." in out
+
+    def test_the_edit_locks_keep_no_names(self):
+        import gc
+        lock = server_mod._run_edit_lock("some-run")
+        assert server_mod._run_edit_lock("SOME-run") is lock
+        del lock
+        gc.collect()
+        assert "some-run" not in server_mod._RUN_EDIT_LOCKS
+        with pytest.raises(ValueError):
+            server_mod._run_edit_lock("../x")
 
     def test_a_refused_edit_uploads_nothing(self, http_mode):
         c = self._client(http_mode)

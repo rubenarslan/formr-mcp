@@ -21,16 +21,14 @@ class TestFormV2Topic:
 
     def test_form_unit_identity_documented(self):
         body = doc.get_documentation("form-v2")
-        assert "form_study_id" in body
         assert "rendering_mode" in body
         # The Survey-vs-Form distinction is the thing people get wrong.
         assert "survey_run_units.unit_id" in body
 
-    def test_export_round_trip_warning_present(self):
-        """The export drops a Form's study_id; uploading a fetched structure
-        unchanged detaches the study. This warning must not disappear."""
+    def test_round_trip_documented(self):
+        """A fetched structure sent back keeps a Form and its study (run_unit_id)."""
         body = doc.get_documentation("form-v2")
-        assert "study_id" in body
+        assert "study_id" in body and "run_unit_id" in body
         names = [s["name"] for s in doc.get_sections("form-v2")]
         assert any("round-trip" in n for n in names)
 
@@ -82,8 +80,8 @@ class TestNewItemTypeDocs:
     def test_item_types_topic_title_counts_the_classes(self):
         title = next(t["title"] for t in doc.get_topics() if t["name"] == "item-types")
         # KNOWN_ITEM_TYPES carries one alias (datetime_local) over the PHP classes.
-        assert "59" in title
-        assert len(KNOWN_ITEM_TYPES) == 60
+        assert "62" in title
+        assert len(KNOWN_ITEM_TYPES) == 63
 
     def test_rank_storage_format_documented(self):
         """Agents need to know rank stores keys joined by ', ' so they write

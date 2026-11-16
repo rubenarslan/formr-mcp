@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import os
+import weakref
 import webbrowser
 from contextlib import asynccontextmanager
 from typing import Annotated, AsyncIterator, Literal
@@ -29,6 +30,7 @@ from formr_mcp.client import (
     FormrAuthExpired,
     FormrClient,
     FormrClientError,
+    FormrConflict,
     FormrPermissionError,
     resolve_timeout,
 )
@@ -52,6 +54,7 @@ from formr_mcp.summarize import find_items, summarize_run_structure
 from formr_mcp.utils import (
     MEMORY_STRUCTURES,
     run_filepath,
+    save_structure,
     validate_run_name,
     workspace_file,
 )
@@ -103,6 +106,14 @@ _HTTP_STRUCTURE_READ_TOOLS = ("summarize_run", "find_run_items", "analyze_run")
 _HTTP_STRUCTURE_EDIT_TOOLS = ("add_run_unit", "remove_run_unit", "duplicate_run_units",
                               "shift_run_positions", "renormalize_positions")
 _WRITE_SCOPES = {"run:write", "run:delete", "survey:write", "session:write", "user:write", "file:write"}
+# Tools that also call an endpoint of another scope: without it the write
+# lands and the tool fails after, and a retry writes again.
+_ALSO_NEEDS = {
+    "get_run_logs": "session:read",
+    "create_test_sessions": "run:read",
+    "upload_run_file": "file:read",
+    "test_session_action": "session:read",
+}
 
 
 def _build_capability_report(caps: dict, token_scopes: list[str]) -> dict:
@@ -145,8 +156,8 @@ def _build_capability_report(caps: dict, token_scopes: list[str]) -> dict:
                                      "run:write, which this token has)")
             else:
                 tool_access[tool] = f"blocked: requires '{scope}' scope"
-        elif tool == "get_run_logs" and "session:read" not in scope_set:
-            tool_access[tool] = "blocked: requires 'session:read' and 'data:read' scopes"
+        elif tool in _ALSO_NEEDS and _ALSO_NEEDS[tool] not in scope_set:
+            tool_access[tool] = f"blocked: requires '{_ALSO_NEEDS[tool]}' and '{scope}' scopes"
         elif tool in ("get_run_results", "get_run_logs") and mode == gate.TEST_ONLY:
             tool_access[tool] = "available: TEST sessions only (FORMR_DATA_ACCESS=test_only)"
         else:
@@ -249,6 +260,10 @@ WORKFLOW — editing run structures, two paths:
     1. get_run_structure(name) → returns the structure as JSON text
     2. edit that JSON in your reply
     3. update_run_structure(name, structure_json) → validates and uploads
+  Keep each unit's run_unit_id and the structure's "version" as fetched: formr keeps those
+  units, and their participants stay on them, and refuses an upload made from a copy that has
+  changed since. Leave run_unit_id out for a new unit, never copy it. Removing a unit
+  participants are in needs confirm_removal=true, which only the user's go-ahead justifies.
 
 PATTERNS — For complex runs (condition/covariate balancing, waiting rooms, loading screens,
 live aggregate feedback, adaptive loops, personalized emails, external API/SMS calls, DRY R
@@ -374,7 +389,13 @@ async def update_run_settings(name: RunName, settings: dict, ctx: Context = None
             f"Valid settings: {', '.join(sorted(VALID_SETTINGS))}"
         )
     client = _client(ctx)
-    await client.patch_run(name, settings)
+    if HTTP_MODE:
+        # not in the middle of a unit tool's fetch, edit, upload of this run,
+        # whose upload carries the run's settings as they were
+        async with _run_edit_lock(name):
+            await client.patch_run(name, settings)
+    else:
+        await client.patch_run(name, settings)
     return await client.get_run(name)
 
 
@@ -430,11 +451,13 @@ def _normalize_survey_choices(structure: dict) -> None:
 
 
 def _unit_signature(structure: dict) -> list[tuple]:
-    """(position, type) per unit; Page is exported as Endpage, so compare them as one."""
+    """(position, type) per unit. Page is exported as Endpage, and a unit placing
+    a study as Survey or Form by the study's engine, whatever it was sent as:
+    compare each pair as one."""
     sig = []
     for u in structure.get("units", []) or []:
         if isinstance(u, dict):
-            t = "Endpage" if u.get("type") == "Page" else u.get("type")
+            t = {"Page": "Endpage", "Form": "Survey"}.get(u.get("type"), u.get("type"))
             pos = u.get("position")
             # formr accepts numeric strings; compare "10" and 10 as one position.
             try:
@@ -445,41 +468,121 @@ def _unit_signature(structure: dict) -> list[tuple]:
     return sorted(sig, key=lambda x: (not isinstance(x[0], int), x[0] if isinstance(x[0], int) else 0, str(x)))
 
 
-async def _upload_structure(client: FormrClient, name: str, structure: dict) -> str:
-    """Validate a run structure and PUT it, then check what formr stored."""
+async def _upload_structure(client: FormrClient, name: str, structure: dict,
+                            confirm_removal: bool = False,
+                            confirm_hint: str = "upload again with confirm_removal=true") -> tuple[str, dict]:
+    """Validate a run structure and PUT it, then check what formr stored.
+    Returns the message and the stored structure (its new units now have
+    their run_unit_id, and it carries formr's new version). confirm_hint: how
+    the caller's tool confirms a removal formr refused."""
     _normalize_survey_choices(structure)
     errors = validate_structure(structure)
     if errors:
         raise ValueError(
             "Structure validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
         )
-    await client.put_run_structure(name, structure)
-    result = await client.get_run_structure(name)
-    _verify_upload(name, structure, result)
-    units = len(result.get("units", []))
-    return f"Run '{name}': successfully updated ({units} units)."
+    try:
+        answer = await client.put_run_structure(name, structure, confirm_removal=confirm_removal)
+    except FormrConflict as e:
+        units = e.body.get("units_in_use")
+        if units:
+            raise ValueError(
+                f"Run '{name}': nothing was uploaded. It would remove units that participants are in: "
+                f"{_units_in_use(units)}. Their current step there would end, and they would go on to what "
+                "then stands in its place. If a unit was left out by mistake, keep it (with its run_unit_id). "
+                "Otherwise tell the user which units, and that participants are at them; only with their "
+                f"go-ahead, {confirm_hint}."
+            ) from e
+        if "version" in e.body:
+            raise ValueError(
+                f"Run '{name}': nothing was uploaded. The run's structure has changed in formr since it was "
+                "fetched (in formr's editor, or by another upload). Fetch it again and make the change on "
+                "that; uploading the old copy would undo those changes."
+            ) from e
+        raise
+    except FormrClientError as e:
+        # a refusal (401, 403, 4xx) changed nothing; a time-out may have
+        if "timed out" in str(e):
+            raise ValueError(
+                f"Run '{name}': the upload's answer was lost ({e}). formr may have applied it: fetch the "
+                "structure and check before repeating the change, or it is made twice."
+            ) from e
+        raise
+    try:
+        stored = await client.get_run_structure(name)
+    except FormrClientError as e:
+        raise ValueError(
+            f"Run '{name}': formr applied the upload ({_merge_summary(answer)}), but reading it back "
+            f"failed ({e}). Do not repeat the change: fetch the structure to see it."
+        ) from e
+    _verify_upload(name, structure, stored)
+    units = len(stored.get("units", []))
+    message = f"Run '{name}': successfully updated ({units} units). " + _merge_summary(answer)
+    if isinstance(answer, dict) and answer.get("warnings"):
+        message += f" formr says: {answer['warnings']}"
+    return message, stored
+
+
+def _units_in_use(units: list) -> str:
+    """The units a refused upload would remove. How many participants are at
+    each only where real participants' data may reach the model."""
+    show_counts = gate.data_access_mode() != gate.TEST_ONLY
+    return "; ".join(
+        f"{u.get('type')} at position {u.get('position')}"
+        + (f" ({u.get('participants')} participant(s))" if show_counts else "")
+        for u in units if isinstance(u, dict))
+
+
+def _merge_summary(answer) -> str:
+    """What formr's upload answer says it did to the run and its participants
+    (their numbers only where real participants' data may reach the model)."""
+    if not isinstance(answer, dict) or "kept" not in answer:
+        # a formr from before v2.0.0-rc13 replaces the whole structure
+        return ("This formr replaced the whole structure and ended every participant's current "
+                "step: each starts it again (a survey from its first page, a Pause from its "
+                "start) at their next visit.")
+    n = {k: int(answer.get(k) or 0) for k in
+         ("kept", "moved", "created", "removed", "participants_moved", "steps_ended")}
+    text = (f"Kept {n['kept']} unit(s) in place ({n['moved']} moved), created {n['created']}, "
+            f"removed {n['removed']}.")
+    show_counts = gate.data_access_mode() != gate.TEST_ONLY
+    if n["participants_moved"]:
+        text += (f" {n['participants_moved']} participant(s)" if show_counts else " Participants") + \
+            " moved along with their unit."
+    if n["steps_ended"]:
+        text += (f" {n['steps_ended']} participant step(s)" if show_counts else " Participants' steps") + \
+            " at removed units ended; formr moves them on to what now stands there."
+    return text
 
 
 # Over HTTP an edit of a run is fetch, edit, upload (a whole-structure PUT):
 # two at once (parallel tool calls) would both edit the same fetched
 # structure, and the later upload would drop the earlier edit. One edit of a
-# run at a time, in this process.
-_RUN_EDIT_LOCKS: dict[str, asyncio.Lock] = {}
+# run at a time, in this process. A lock lives while a call holds it: the
+# map keeps no name nobody is editing.
+_RUN_EDIT_LOCKS: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
 
 
 def _run_edit_lock(name: str) -> asyncio.Lock:
-    return _RUN_EDIT_LOCKS.setdefault(name.lower(), asyncio.Lock())
+    validate_run_name(name)
+    key = name.lower()
+    lock = _RUN_EDIT_LOCKS.get(key)
+    if lock is None:
+        lock = _RUN_EDIT_LOCKS[key] = asyncio.Lock()
+    return lock
 
 
 @asynccontextmanager
-async def _run_structure(ctx: Context, name: str, *, upload: bool = False):
+async def _run_structure(ctx: Context, name: str, *, upload: bool = False, confirm_removal: bool = False,
+                         confirm_hint: str = "remove them with remove_run_unit(name, position, confirm_removal=true)"):
     """Over HTTP the server keeps no workspace: the run's structure is fetched
     with the caller's token for this one call (utils.MEMORY_STRUCTURES), so
     formr decides whether the caller may see it, and an edit is validated and
-    uploaded after (yields a list that receives the upload's message). An edit
-    that changed nothing is not uploaded: formr's upload replaces the run's
-    structure and expires every participant's current unit session. Over
-    stdio the tools use the workspace files as before."""
+    uploaded after (yields a list that receives the upload's message). formr
+    keeps the units that come back with their run_unit_id; one the edit drops
+    is removed, which formr refuses where participants are unless
+    confirm_removal. An edit that changed nothing is not uploaded. Over stdio
+    the tools use the workspace files as before."""
     uploaded: list[str] = []
     if not HTTP_MODE:
         yield uploaded
@@ -500,7 +603,9 @@ async def _run_structure(ctx: Context, name: str, *, upload: bool = False):
             if store[name] == fetched:
                 uploaded.append(f"Run '{name}' is unchanged: nothing was uploaded to formr.")
             else:
-                uploaded.append(await _upload_structure(client, name, store[name]))
+                message, _ = await _upload_structure(client, name, store[name], confirm_removal=confirm_removal,
+                                                     confirm_hint=confirm_hint)
+                uploaded.append(message)
     finally:
         if lock is not None:
             lock.release()
@@ -527,12 +632,15 @@ def _verify_upload(name: str, sent: dict, stored: dict) -> None:
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False))
-async def update_run_structure_from_file(name: RunName, ctx: Context = None) -> str:
+async def update_run_structure_from_file(name: RunName, confirm_removal: bool = False, ctx: Context = None) -> str:
     """Read a run structure from .formr/<name>.json, validate, and upload to formr.
 
+    formr keeps every unit that keeps its run_unit_id, with its participants;
+    a unit without one is new. Removing a unit participants are in is refused
+    unless confirm_removal=True: pass it only after the user agreed.
     Returns a summary on success, or validation errors to fix and retry.
-    On success, the backup file (.formr/<name>.json.bak) is removed.
-    To inspect the uploaded result, call get_run_structure_to_file again.
+    On success the file is rewritten with what formr stored (new units get
+    their run_unit_id) and the backup file (.formr/<name>.json.bak) is removed.
     """
     validate_run_name(name)
     filepath = run_filepath(name)
@@ -549,7 +657,12 @@ async def update_run_structure_from_file(name: RunName, ctx: Context = None) -> 
     with open(filepath, encoding="utf-8") as f:
         structure = json.load(f)
 
-    message = await _upload_structure(client, name, structure)
+    message, stored = await _upload_structure(
+        client, name, structure, confirm_removal=confirm_removal,
+        confirm_hint=f'upload again with update_run_structure_from_file("{name}", confirm_removal=true)')
+    # the next edit starts from formr's ids and version, or its new units
+    # would be new again and the next upload refused as made from an old copy
+    save_structure(name, stored)
 
     if bak_path.exists():
         bak_path.unlink()
@@ -572,14 +685,20 @@ async def get_run_structure(name: RunName, ctx: Context = None) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False))
-async def update_run_structure(name: RunName, structure_json: str, ctx: Context = None) -> str:
+async def update_run_structure(name: RunName, structure_json: str, confirm_removal: bool = False,
+                               ctx: Context = None) -> str:
     """Validate a run structure passed as JSON text and upload it to formr.
 
     Inline counterpart to get_run_structure for clients without filesystem access.
     Pass the FULL structure as a JSON string — an object with a "units" array. It is
     validated exactly like the file-based path; on failure you get the errors to fix
-    and retry (nothing is uploaded). For editor/CLI workflows, update_run_structure_from_file
-    is usually more convenient.
+    and retry (nothing is uploaded). Keep each unit's run_unit_id as fetched: formr
+    keeps those units, with their participants; leave it out for a new unit, and
+    never copy it. Keep "version": formr refuses a copy that has changed since.
+    Removing a unit participants are in is refused unless confirm_removal=True: pass
+    it only after the user agreed. Fetch the structure again before the next edit
+    (new units get their run_unit_id, the run a new version). For editor/CLI
+    workflows, update_run_structure_from_file is usually more convenient.
     """
     validate_run_name(name)
     try:
@@ -593,8 +712,12 @@ async def update_run_structure(name: RunName, structure_json: str, ctx: Context 
     if HTTP_MODE:
         # not in the middle of a unit tool's fetch, edit, upload of this run
         async with _run_edit_lock(name):
-            return await _upload_structure(client, name, structure)
-    return await _upload_structure(client, name, structure)
+            message, _ = await _upload_structure(client, name, structure, confirm_removal=confirm_removal,
+                                                 confirm_hint="upload again with confirm_removal=true")
+            return message
+    message, _ = await _upload_structure(client, name, structure, confirm_removal=confirm_removal,
+                                         confirm_hint="upload again with confirm_removal=true")
+    return message
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -708,17 +831,15 @@ async def add_run_unit(name: RunName, unit_type: str, position: int, description
       Branch/SkipForward/SkipBackward: condition (R expr), if_true (int position)
       Email: subject, body, account_id (int), recipient_field
       Survey: study_id (int) or survey_data (dict)
-      Form: study_id (int) — form_v2 renderer; sets the study's rendering_mode='v2'
+      Form: study_id (int) — a study on form_v2 (its rendering_mode decides; placing it changes nothing)
       External: address (URL or R code)
       Wait: body (int position — NOT display content)
       Page/Endpage: body (markdown)
       Pause: wait_minutes, wait_until_time, wait_until_date, relative_to
 
-    insert_mode: 'shift' (default) shifts units at >= position up by 10; 'overwrite' replaces. Position references are auto-remapped.
-
-    Form gotcha: the run-structure export omits a Form's study_id, so re-add it
-    to .formr/<name>.json before uploading or the unit loses its study. See
-    get_documentation("form-v2").
+    insert_mode: 'shift' (default) shifts units at >= position up by 10; 'overwrite' replaces
+    (a unit of the same type in place, keeping its participants). Position references are
+    auto-remapped. See get_documentation("form-v2") for Form units.
     """
     validate_run_name(name)
     async with _run_structure(ctx, name, upload=True) as uploaded:
@@ -728,15 +849,20 @@ async def add_run_unit(name: RunName, unit_type: str, position: int, description
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False, openWorldHint=False))
-async def remove_run_unit(name: RunName, position: int, compact: bool = False, ctx: Context = None) -> str:
+async def remove_run_unit(name: RunName, position: int, compact: bool = False,
+                          confirm_removal: bool = False, ctx: Context = None) -> str:
     """Remove a unit at the given position from the local run structure file.
 
     Locally the file must exist (fetch with get_run_structure_to_file first); a hosted server edits the run in formr, validated and uploaded in one step.
     Locally, call update_run_structure_from_file to upload after removing.
     compact=True shifts higher positions down by 1 and remaps references; dangling references are reported.
+    Participants at the removed unit end their step there and go on to what then stands in
+    its place. formr refuses to remove a unit participants are at, as its run editor asks
+    first: tell the user, and only with their go-ahead call again with confirm_removal=True.
     """
     validate_run_name(name)
-    async with _run_structure(ctx, name, upload=True) as uploaded:
+    async with _run_structure(ctx, name, upload=True, confirm_removal=confirm_removal,
+                              confirm_hint="call remove_run_unit again with confirm_removal=true") as uploaded:
         result = editing_remove_run_unit(name, position, compact=compact)
     return _with_upload(result, uploaded)
 
@@ -1167,12 +1293,18 @@ _HTTP_WORKFLOW = """WORKFLOW — editing run structures (this server keeps no fi
   renormalize_positions) fetch the run, edit, validate and upload it in one step; summarize_run,
   find_run_items and analyze_run read it from formr. Upload files with upload_run_file(text=…)
   or content_base64.
-  Every upload (each unit tool's, update_run_structure's) replaces the run's whole structure in
-  formr at once and expires every participant's current unit session (one waiting at a Pause is
-  not moved on until they return). On a run with participants, make all changes in one
-  get_run_structure + update_run_structure, and tell the user first."""
+  Uploads change only what changed: formr keeps every unit sent back with its run_unit_id
+  (get_run_structure gives it), and participants stay on it, moving with it when its position
+  changes. Leave run_unit_id out for a new unit and never copy it to another. Keep "version"
+  too: formr refuses an upload made from a copy that has changed since (fetch again then). A
+  unit left out is removed, and its participants go on to what then stands in its place: formr
+  refuses that where participants are, as its editor asks first. Tell the user which units,
+  and pass confirm_removal=true (remove_run_unit, update_run_structure) only with their go-ahead.
+  A formr older than v2.0.0-rc13 (get_run_structure gives no run_unit_id) replaces the whole
+  structure on every upload and restarts every participant's current step: there, make all
+  changes in one get_run_structure + update_run_structure, and tell the user first."""
 
-# Tools that upload a run structure over HTTP: each call replaces the live run.
+# Tools that upload a run structure over HTTP: each call changes the live run.
 _HTTP_UPLOAD_TOOLS = ("add_run_unit", "remove_run_unit", "duplicate_run_units",
                       "shift_run_positions", "renormalize_positions", "update_run_structure")
 
@@ -1181,10 +1313,9 @@ _HTTP_UPLOAD_TOOLS = ("add_run_unit", "remove_run_unit", "duplicate_run_units",
 _HTTP_DESCRIPTION_EDITS = {
     "get_run_structure": (" For editor/CLI workflows with file access, prefer\n"
                           "    get_run_structure_to_file + update_run_structure_from_file (better for large runs).", ""),
-    "update_run_structure": (" For editor/CLI workflows, update_run_structure_from_file\n"
-                             "    is usually more convenient.", ""),
+    "update_run_structure": (" For editor/CLI\n"
+                             "    workflows, update_run_structure_from_file is usually more convenient.", ""),
     "get_pattern": ("analyze_run + update_run_structure_from_file", "analyze_run + update_run_structure"),
-    "add_run_unit": ("re-add it\n    to .formr/<name>.json before uploading", "add it\n    to the structure (get_run_structure + update_run_structure)"),
 }
 
 
