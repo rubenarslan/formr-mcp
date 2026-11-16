@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urljoin, quote
 
 import httpx
@@ -48,6 +48,16 @@ class FormrPermissionError(FormrClientError):
     pass
 
 
+def _segment(value: str) -> str:
+    """One segment of a formr API path. `.` and `..` would be dot segments,
+    which urljoin resolves: a file named `..` made DELETE runs/<run>/files/..
+    a DELETE of the run itself."""
+    value = str(value)
+    if value in ("", ".", ".."):
+        raise ValueError(f"{value!r} is not a valid name here.")
+    return quote(value, safe="")
+
+
 class FormrClient:
     def __init__(
         self,
@@ -57,6 +67,7 @@ class FormrClient:
         http_client: httpx.AsyncClient | None = None,
         *,
         access_token: str | None = None,
+        on_token_refused: Callable[[], None] | None = None,
     ):
         self.base_url = base_url.rstrip("/") + "/"
         self.client_id = client_id
@@ -65,6 +76,10 @@ class FormrClient:
         # the MCP server, which formr issued it when its researcher connected).
         # Used as it is: it is the client's to refresh, never this server's.
         self._access_token = access_token
+        # Told when formr refuses that token (HTTP mode: the token verifier
+        # forgets its cached answer, so the client's next request gets a 401
+        # and refreshes).
+        self._on_token_refused = on_token_refused
         self._http = http_client or httpx.AsyncClient(timeout=resolve_timeout())
         self._token: OAuthToken | None = None
         self._owns_http = http_client is None
@@ -127,9 +142,13 @@ class FormrClient:
                  (time.perf_counter() - t0) * 1000)
 
         if resp.status_code == 401 and self._access_token is not None:
+            if self._on_token_refused is not None:
+                self._on_token_refused()
             raise FormrAuthExpired(
-                "formr no longer accepts this connection's token (expired, revoked, or the "
-                "connection was deleted under Account -> API). Reconnect the app to formr."
+                "formr no longer accepts this connection's token: it expired, the connection's "
+                "access was changed, or the connection was deleted under Account -> API. Try "
+                "again: the app gets a new token by itself. Only if formr asks to sign in, "
+                "connect the app again."
             )
         if resp.status_code == 401 and not retried:
             self._token = None
@@ -157,7 +176,7 @@ class FormrClient:
     async def get_survey(self, name: str, format: str = "json") -> Any:
         validate_run_name(name)
         return await self.request(
-            "GET", f"api/v1/surveys/{quote(name, safe='')}", params={"format": format}
+            "GET", f"api/v1/surveys/{_segment(name)}", params={"format": format}
         )
 
     async def get_runs(self, name: str | None = None) -> list[dict]:
@@ -166,43 +185,45 @@ class FormrClient:
 
     async def get_run(self, name: str) -> dict:
         validate_run_name(name)
-        return await self.request("GET", f"api/v1/runs/{quote(name, safe='')}")
+        return await self.request("GET", f"api/v1/runs/{_segment(name)}")
 
     async def get_run_structure(self, name: str) -> dict:
         validate_run_name(name)
-        return await self.request("GET", f"api/v1/runs/{quote(name, safe='')}/structure")
+        return await self.request("GET", f"api/v1/runs/{_segment(name)}/structure")
 
     async def put_run_structure(self, name: str, structure: dict) -> dict:
         validate_run_name(name)
         return await self.request(
-            "PUT", f"api/v1/runs/{quote(name, safe='')}/structure", json=structure
+            "PUT", f"api/v1/runs/{_segment(name)}/structure", json=structure
         )
 
     async def create_run(self, name: str) -> dict:
         validate_run_name(name)
-        return await self.request("POST", f"api/v1/runs/{quote(name, safe='')}")
+        return await self.request("POST", f"api/v1/runs/{_segment(name)}")
 
     async def patch_run(self, name: str, settings: dict) -> dict:
         validate_run_name(name)
-        return await self.request("PATCH", f"api/v1/runs/{quote(name, safe='')}", json=settings)
+        return await self.request("PATCH", f"api/v1/runs/{_segment(name)}", json=settings)
 
     async def delete_run(self, name: str) -> None:
         validate_run_name(name)
-        return await self.request("DELETE", f"api/v1/runs/{quote(name, safe='')}")
+        return await self.request("DELETE", f"api/v1/runs/{_segment(name)}")
 
     async def get_user_me(self) -> dict:
         return await self.request("GET", "api/v1/user/me")
 
     async def get_token_info(self) -> dict:
         """GET /user/token: the calling token's account, scopes, expiry and runs
-        (no scope needed). The HTTP server checks every bearer token with it."""
+        (no scope needed), the endpoint the HTTP server's FormrTokenVerifier
+        checks every bearer token with."""
         return await self.request("GET", "api/v1/user/token")
 
     # --- capability / permission introspection ---
 
     async def scopes(self) -> list[str]:
-        """The scopes granted to the current token, from the OAuth grant
-        response (no extra request). Reliable for pre-checks."""
+        """The scopes granted to the current token: from the OAuth grant
+        response (no extra request), or for a caller's own token (HTTP mode)
+        from GET /user/token. Reliable for pre-checks."""
         if self._access_token is not None:
             return list((await self.get_capabilities()).get("scopes") or [])
         await self._ensure_token()
@@ -216,6 +237,8 @@ class FormrClient:
             if self._access_token is not None:
                 # a connection's token may lack user:read; /user/token needs none
                 info = await self.get_token_info()
+                if not isinstance(info, dict):
+                    raise FormrClientError("formr's GET /api/v1/user/token answered with no token information.")
                 self._capabilities = {
                     "id": info.get("account_id"),
                     "email": info.get("email"),
@@ -272,13 +295,13 @@ class FormrClient:
         if testing is not None:
             params["testing"] = "true" if testing else "false"
         return await self.request(
-            "GET", f"api/v1/runs/{quote(run, safe='')}/sessions", params=params
+            "GET", f"api/v1/runs/{_segment(run)}/sessions", params=params
         )
 
     async def get_session(self, run: str, code: str) -> dict:
         validate_run_name(run)
         return await self.request(
-            "GET", f"api/v1/runs/{quote(run, safe='')}/sessions/{quote(code, safe='')}"
+            "GET", f"api/v1/runs/{_segment(run)}/sessions/{_segment(code)}"
         )
 
     async def get_unit_sessions(
@@ -297,7 +320,7 @@ class FormrClient:
         if include_log:
             params["include_log"] = "true"
         return await self.request(
-            "GET", f"api/v1/runs/{quote(run, safe='')}/unit_sessions", params=params
+            "GET", f"api/v1/runs/{_segment(run)}/unit_sessions", params=params
         )
 
     @staticmethod
@@ -328,7 +351,7 @@ class FormrClient:
         if kind not in ("email", "push"):
             raise ValueError("kind must be 'email' or 'push'")
         return await self.request(
-            "GET", f"api/v1/runs/{quote(run, safe='')}/logs/{kind}",
+            "GET", f"api/v1/runs/{_segment(run)}/logs/{kind}",
             params=self._log_params(session, testing, since, limit, offset),
         )
 
@@ -344,7 +367,7 @@ class FormrClient:
         if codes:
             body["code"] = codes
         return await self.request(
-            "POST", f"api/v1/runs/{quote(run, safe='')}/sessions", json=body
+            "POST", f"api/v1/runs/{_segment(run)}/sessions", json=body
         )
 
     async def session_action(
@@ -356,7 +379,7 @@ class FormrClient:
             body["position"] = position
         return await self.request(
             "POST",
-            f"api/v1/runs/{quote(run, safe='')}/sessions/{quote(code, safe='')}/actions",
+            f"api/v1/runs/{_segment(run)}/sessions/{_segment(code)}/actions",
             json=body,
         )
 
@@ -377,12 +400,12 @@ class FormrClient:
         if items:
             params["items"] = ",".join(items)
         return await self.request(
-            "GET", f"api/v1/runs/{quote(run, safe='')}/results", params=params
+            "GET", f"api/v1/runs/{_segment(run)}/results", params=params
         )
 
     async def get_run_files(self, run: str) -> list[dict]:
         validate_run_name(run)
-        return await self.request("GET", f"api/v1/runs/{quote(run, safe='')}/files")
+        return await self.request("GET", f"api/v1/runs/{_segment(run)}/files")
 
     async def upload_run_file(
         self, run: str, filename: str, content: bytes, content_type: str = "application/octet-stream"
@@ -391,12 +414,12 @@ class FormrClient:
         Bytes, not a file object, so the 401 retry can send them again."""
         validate_run_name(run)
         return await self.request(
-            "POST", f"api/v1/runs/{quote(run, safe='')}/files",
+            "POST", f"api/v1/runs/{_segment(run)}/files",
             files={"file": (filename, content, content_type)},
         )
 
     async def delete_run_file(self, run: str, filename: str) -> Any:
         validate_run_name(run)
         return await self.request(
-            "DELETE", f"api/v1/runs/{quote(run, safe='')}/files/{quote(filename, safe='')}"
+            "DELETE", f"api/v1/runs/{_segment(run)}/files/{_segment(filename)}"
         )

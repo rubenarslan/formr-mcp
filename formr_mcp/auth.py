@@ -6,6 +6,7 @@ from urllib.parse import urljoin
 
 import httpx
 from mcp.server.auth.provider import AccessToken
+from starlette.authentication import AuthenticationError
 
 log = logging.getLogger("formr_mcp.auth")
 
@@ -110,6 +111,12 @@ async def get_token(
             await client.aclose()
 
 
+class FormrUnavailable(AuthenticationError):
+    """formr did not answer a token check (down, restarting, an error): the
+    token may well be good, so this is no 401 that sends the client to sign in
+    again (http_server answers 503)."""
+
+
 class FormrTokenVerifier:
     """The HTTP server's check of every bearer token a client sends: formr,
     which issued it when its researcher connected the app, says whose it is
@@ -117,7 +124,11 @@ class FormrTokenVerifier:
     taken (one formr issued for this MCP server: connector_client_id set), not
     a token of a credential made for a script. Answers are kept for `ttl`
     seconds by the token's hash, never past the token's expiry, so a connection
-    deleted in formr stops here within that time (and at formr at once).
+    deleted in formr stops here within that time (and at formr at once; a tool
+    call that formr refuses drops the answer, forget()). While formr does not
+    answer, a token's last answer stands until the token expires, and a token
+    with none gets FormrUnavailable (503), never the 401 that sends the client
+    to sign in again.
     """
 
     def __init__(self, base_url: str, http_client: httpx.AsyncClient, resource: str,
@@ -129,24 +140,44 @@ class FormrTokenVerifier:
         self._max_entries = max_entries
         self._cache: dict[str, tuple[float, AccessToken]] = {}
 
+    @staticmethod
+    def _key(token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def forget(self, token: str) -> None:
+        """Drop a token formr has refused since it was checked (FormrClient's
+        401: its connection was changed or deleted): the client's next request
+        with it gets the 401 that makes it refresh, not the cached answer."""
+        self._cache.pop(self._key(token), None)
+
     async def verify_token(self, token: str) -> AccessToken | None:
-        key = hashlib.sha256(token.encode()).hexdigest()
+        # A token formr refuses, or an answer that is no connection's, is no
+        # access (a 401 that sends the client to sign in). formr not answering
+        # is not that: FormrUnavailable (a 503), or the last answer while the
+        # token is unexpired. Nothing else raises (no 500).
+        key = self._key(token)
         now = time.time()
         hit = self._cache.get(key)
         if hit and hit[0] > now:
             return hit[1]
-        self._cache.pop(key, None)
         try:
             resp = await self._http.get(self._url, headers={"Authorization": f"Bearer {token}"})
+        except ValueError as e:
+            # a token httpx can't put in a header (non-ASCII): no token of formr's
+            log.info("token check: refused an unusable token (%s)", type(e).__name__)
+            return None
         except httpx.HTTPError as e:
-            log.warning("token check: formr unreachable (%s)", type(e).__name__)
+            return self._while_unavailable(key, hit, now, type(e).__name__)
+        if resp.status_code in (400, 401, 403):
+            self._cache.pop(key, None)
             return None
         if resp.status_code != 200:
-            return None
+            return self._while_unavailable(key, hit, now, f"HTTP {resp.status_code}")
         try:
             info = resp.json()
-            if not info.get("connector_client_id"):
+            if not isinstance(info, dict) or not info.get("connector_client_id"):
                 log.info("token check: refused a token that is not a connection's")
+                self._cache.pop(key, None)
                 return None
             expires = int(info["expires"]) if info.get("expires") else None
             access = AccessToken(
@@ -158,13 +189,27 @@ class FormrTokenVerifier:
                 subject=str(info["account_id"]),
                 claims={"connector_client_id": info["connector_client_id"]},
             )
-        except (ValueError, KeyError, TypeError) as e:
+        except Exception as e:
             log.warning("token check: unexpected answer from formr (%s)", type(e).__name__)
+            self._cache.pop(key, None)
             return None
         if len(self._cache) >= self._max_entries:
-            self._cache.clear()
+            # the expired first, all only when every entry is live
+            self._cache = {k: v for k, v in self._cache.items() if v[0] > now}
+            if len(self._cache) >= self._max_entries:
+                self._cache.clear()
         until = now + self._ttl
         if expires is not None:
             until = min(until, expires)
         self._cache[key] = (until, access)
         return access
+
+    def _while_unavailable(self, key: str, hit, now: float, why: str) -> AccessToken:
+        """formr did not answer: its last answer for this token while the token
+        itself is unexpired (formr checks it again on every tool call anyway),
+        else FormrUnavailable."""
+        if hit is not None and hit[1].expires_at and hit[1].expires_at > now:
+            log.warning("token check: formr unavailable (%s), its last answer is used", why)
+            return hit[1]
+        log.warning("token check: formr unavailable (%s)", why)
+        raise FormrUnavailable(f"formr is not answering ({why}); try again shortly.")

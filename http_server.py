@@ -26,11 +26,12 @@ from urllib.parse import urlparse
 import uvicorn
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.transport_security import TransportSecuritySettings
-from starlette.responses import JSONResponse
+from starlette.middleware.authentication import AuthenticationMiddleware
+from starlette.responses import JSONResponse, PlainTextResponse
 
 # Triggers server.py's load_dotenv() + builds the FastMCP instance (`mcp`).
 import server
-from formr_mcp.auth import FormrTokenVerifier
+from formr_mcp.auth import FormrTokenVerifier, FormrUnavailable
 
 
 class HealthzMiddleware:
@@ -47,6 +48,14 @@ class HealthzMiddleware:
         await self.app(scope, receive, send)
 
 
+def _auth_error(conn, exc):
+    """formr not answering the token check is a 503 to retry, not a bad token."""
+    if isinstance(exc, FormrUnavailable):
+        return JSONResponse({"error": "temporarily_unavailable", "error_description": str(exc)},
+                            status_code=503, headers={"Retry-After": "5"})
+    return PlainTextResponse(str(exc), status_code=400)
+
+
 def build_app():
     base_url = os.environ.get("FORMR_BASE_URL", "").strip().rstrip("/")
     public_url = os.environ.get("MCP_PUBLIC_URL", "").strip().rstrip("/")
@@ -54,6 +63,8 @@ def build_app():
         raise SystemExit("FORMR_BASE_URL and MCP_PUBLIC_URL must be set.")
     mcp_path = urlparse(public_url).path or "/mcp"
 
+    # the tools call formr at the same address the tokens are checked with
+    server.BASE_URL = base_url
     server.configure_http_mode()
     mcp = server.mcp
     mcp.settings.stateless_http = True
@@ -72,7 +83,11 @@ def build_app():
         allowed_hosts=[host, f"{host}:*"],
         allowed_origins=[f"https://{host}", f"https://{host}:*"],
     )
-    return HealthzMiddleware(mcp.streamable_http_app())
+    app = mcp.streamable_http_app()
+    for middleware in app.user_middleware:
+        if middleware.cls is AuthenticationMiddleware:
+            middleware.kwargs["on_error"] = _auth_error
+    return HealthzMiddleware(app)
 
 
 def main() -> None:

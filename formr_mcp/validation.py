@@ -358,6 +358,18 @@ def validate_structure(data: dict) -> list[str]:
                     f"Branch unit '{unit_type}' at position {pos}: "
                     f"'if_true'={if_true} does not match any unit position"
                 )
+        elif unit_type == "Wait":
+            # a Wait's body is the position a participant who comes back
+            # early is sent to (formr: run_to); one no unit has is an error
+            # page for them
+            body = unit.get("body")
+            target = body if isinstance(body, int) and not isinstance(body, bool) else (
+                int(body.strip()) if isinstance(body, str) and body.strip().isdigit() else None)
+            if target is not None and target not in positions:
+                errors.append(
+                    f"Wait unit at position {pos}: 'body'={body!r} (where a participant who "
+                    f"comes back early is sent) does not match any unit position"
+                )
 
     if positions:
         first_pos = min(p for p in positions if isinstance(p, int))

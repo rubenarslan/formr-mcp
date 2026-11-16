@@ -205,3 +205,24 @@ class TestFormUnit:
             ]},
         }]})
         assert any("Form unit at position 10" in e for e in errors)
+
+
+class TestWaitTarget:
+    """A Wait's body is the position a participant who comes back early is
+    sent to: one no unit has is an error page for them (formr's RunSession::runTo)."""
+
+    def _structure(self, body):
+        return {"units": [
+            {"type": "Form", "position": 10, "description": "diary", "study_id": 291},
+            {"type": "Wait", "position": 20, "body": body, "wait_minutes": 60},
+            {"type": "Endpage", "position": 30, "body": "done"},
+        ]}
+
+    @pytest.mark.parametrize("body", [30, "30", "", None])
+    def test_a_wait_sending_to_a_unit_or_nowhere_is_accepted(self, body):
+        assert validate_structure(self._structure(body)) == []
+
+    @pytest.mark.parametrize("body", [40, "40"])
+    def test_a_wait_sending_to_no_unit_is_refused(self, body):
+        errors = validate_structure(self._structure(body))
+        assert len(errors) == 1 and "Wait unit at position 20" in errors[0]

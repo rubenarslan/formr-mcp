@@ -15,8 +15,9 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-# Application code
-COPY . .
+# Application code, readable by the non-root user below whatever the
+# checkout's modes (a clone under umask 077 is 0600/0700)
+COPY --chmod=755 . .
 
 ENV PATH="/app/.venv/bin:$PATH" \
     FORMR_WORKSPACE_DIR=/app/.formr \

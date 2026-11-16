@@ -208,3 +208,14 @@ class TestClientRequests:
         assert seen[2].url.path == "/api/v1/runs/demo/logs/email"
         assert seen[2].url.params["testing"] == "true" and seen[2].url.params["limit"] == "5"
         assert seen[3].method == "DELETE" and seen[3].url.raw_path == b"/api/v1/runs/demo/files/a%20b.css"
+
+    def test_dot_segments_are_refused(self, monkeypatch):
+        # urljoin resolves them: a file named ".." was a DELETE of the run
+        seen = []
+        client = self._client(monkeypatch, seen)
+        for name in ("..", ".", ""):
+            with pytest.raises(ValueError):
+                _run(client.delete_run_file("demo", name))
+            with pytest.raises(ValueError):
+                _run(client.get_session("demo", name))
+        assert seen == []

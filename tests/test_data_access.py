@@ -148,6 +148,25 @@ class TestCapabilityReport:
         assert rep["tool_access"]["get_run_results"] == "available"
         assert rep["tool_access"]["create_run"] == "available"
 
+    def test_deleting_runs_is_not_read_only(self, monkeypatch):
+        monkeypatch.setenv("FORMR_DATA_ACCESS", "test_only")
+        rep = server_mod._build_capability_report({"scopes": ["run:read", "run:delete"]}, [])
+        assert "READ-ONLY" not in rep["access_summary"]
+        assert rep["tool_access"]["delete_run"] == "available"
+
+    def test_hosted_structure_tools_are_reported(self, monkeypatch):
+        monkeypatch.setenv("FORMR_DATA_ACCESS", "test_only")
+        monkeypatch.setattr(server_mod, "HTTP_MODE", True)
+        read_only = server_mod._build_capability_report({"scopes": ["run:read"]}, [])["tool_access"]
+        assert read_only["summarize_run"] == "available"
+        assert read_only["get_run_structure"] == "available"
+        assert read_only["add_run_unit"].startswith("blocked")
+        assert "get_run_structure_to_file" not in read_only
+        write_only = server_mod._build_capability_report({"scopes": ["run:write"]}, [])["tool_access"]
+        assert write_only["add_run_unit"] == "blocked: requires 'run:read' and 'run:write' scopes"
+        both = server_mod._build_capability_report({"scopes": ["run:read", "run:write"]}, [])["tool_access"]
+        assert both["add_run_unit"] == "available" and both["update_run_structure"] == "available"
+
     def test_falls_back_to_token_scopes(self, monkeypatch):
         # Old formr without the user/me capability fields: scopes come from token.
         monkeypatch.setenv("FORMR_DATA_ACCESS", "all")

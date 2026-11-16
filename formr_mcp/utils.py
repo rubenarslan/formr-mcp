@@ -115,13 +115,13 @@ def save_structure(name: str, structure: dict) -> str:
 
     Returns a summary string like 'Saved 5 units to .formr/name.json'.
     For a structure fetched for this call (MEMORY_STRUCTURES), it is kept
-    there for the tool to upload.
+    there for the tool to upload if it changed (server._run_structure).
     """
     store = MEMORY_STRUCTURES.get()
     if store is not None:
         validate_run_name(name)
         store[name] = structure
-        return f"Uploading {len(structure.get('units', []))} units to formr."
+        return f"The run's structure now has {len(structure.get('units', []))} units."
     path = safe_run_filepath(name)
     bak_path = path.with_suffix(".json.bak")
     if path.exists():

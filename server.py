@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import http.cookiejar
 import json
 import logging
 import mimetypes
@@ -91,8 +93,16 @@ TOOL_SCOPES = {
     "test_session_action": "session:write",
     "get_run_logs": "data:read",
     "get_survey_structure": "survey:read",
+    "get_run_structure": "run:read",
+    "update_run_structure": "run:write",
 }
-_WRITE_SCOPES = {"run:write", "survey:write", "session:write", "user:write", "file:write"}
+# Over HTTP these read a run's structure from formr (run:read), and these edit
+# and upload it (run:write, and run:read: they read it first, and an upload is
+# checked by reading it back).
+_HTTP_STRUCTURE_READ_TOOLS = ("summarize_run", "find_run_items", "analyze_run")
+_HTTP_STRUCTURE_EDIT_TOOLS = ("add_run_unit", "remove_run_unit", "duplicate_run_units",
+                              "shift_run_positions", "renormalize_positions")
+_WRITE_SCOPES = {"run:write", "run:delete", "survey:write", "session:write", "user:write", "file:write"}
 
 
 def _build_capability_report(caps: dict, token_scopes: list[str]) -> dict:
@@ -115,12 +125,26 @@ def _build_capability_report(caps: dict, token_scopes: list[str]) -> dict:
         parts.append("all owned runs")
     summary = "; ".join(parts)
 
+    tool_scopes = dict(TOOL_SCOPES)
+    if HTTP_MODE:
+        tool_scopes.update({tool: "run:read" for tool in _HTTP_STRUCTURE_READ_TOOLS})
+        tool_scopes.update({tool: "run:write" for tool in _HTTP_STRUCTURE_EDIT_TOOLS})
+    uploads = ("update_run_structure", "update_run_structure_from_file",
+               *(_HTTP_STRUCTURE_EDIT_TOOLS if HTTP_MODE else ()))
+
     tool_access = {}
-    for tool, scope in TOOL_SCOPES.items():
+    for tool, scope in tool_scopes.items():
         if HTTP_MODE and tool in _LOCAL_ONLY_TOOLS:
             continue
-        if scope not in scope_set:
-            tool_access[tool] = f"blocked: requires '{scope}' scope"
+        if tool in uploads and scope in scope_set and "run:read" not in scope_set:
+            tool_access[tool] = "blocked: requires 'run:read' and 'run:write' scopes"
+        elif scope not in scope_set:
+            if tool == "delete_run" and "run:write" in scope_set:
+                # formr before v2.0.0-rc13 has no run:delete: run:write deletes there
+                tool_access[tool] = ("requires 'run:delete' scope (on formr before v2.0.0-rc13, "
+                                     "run:write, which this token has)")
+            else:
+                tool_access[tool] = f"blocked: requires '{scope}' scope"
         elif tool == "get_run_logs" and "session:read" not in scope_set:
             tool_access[tool] = "blocked: requires 'session:read' and 'data:read' scopes"
         elif tool in ("get_run_results", "get_run_logs") and mode == gate.TEST_ONLY:
@@ -146,10 +170,14 @@ _shared_http: httpx.AsyncClient | None = None
 
 def shared_http() -> httpx.AsyncClient:
     """One connection pool for every caller's requests to formr (HTTP mode).
-    It holds no caller's state: each request carries its caller's token."""
+    It holds no caller's state: each request carries its caller's token, and
+    it keeps no cookie (formr's session cookie, kept, would put every caller in
+    one PHP session, whose lock serialises them all)."""
     global _shared_http
     if _shared_http is None:
-        _shared_http = httpx.AsyncClient(timeout=resolve_timeout())
+        _shared_http = httpx.AsyncClient(
+            timeout=resolve_timeout(),
+            cookies=http.cookiejar.CookieJar(policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[])))
     return _shared_http
 
 
@@ -251,7 +279,9 @@ def _client(ctx: Context) -> FormrClient:
     access = getattr(user, "access_token", None)
     if access is None:
         raise FormrAuthExpired("This request carries no formr connection. Connect the app to formr.")
-    return FormrClient(BASE_URL, http_client=shared_http(), access_token=access.token)
+    forget = getattr(getattr(mcp, "_token_verifier", None), "forget", None)
+    return FormrClient(BASE_URL, http_client=shared_http(), access_token=access.token,
+                       on_token_refused=(lambda: forget(access.token)) if forget else None)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -430,27 +460,50 @@ async def _upload_structure(client: FormrClient, name: str, structure: dict) -> 
     return f"Run '{name}': successfully updated ({units} units)."
 
 
+# Over HTTP an edit of a run is fetch, edit, upload (a whole-structure PUT):
+# two at once (parallel tool calls) would both edit the same fetched
+# structure, and the later upload would drop the earlier edit. One edit of a
+# run at a time, in this process.
+_RUN_EDIT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _run_edit_lock(name: str) -> asyncio.Lock:
+    return _RUN_EDIT_LOCKS.setdefault(name.lower(), asyncio.Lock())
+
+
 @asynccontextmanager
 async def _run_structure(ctx: Context, name: str, *, upload: bool = False):
     """Over HTTP the server keeps no workspace: the run's structure is fetched
     with the caller's token for this one call (utils.MEMORY_STRUCTURES), so
     formr decides whether the caller may see it, and an edit is validated and
-    uploaded after (yields a list that receives the upload's message). Over
+    uploaded after (yields a list that receives the upload's message). An edit
+    that changed nothing is not uploaded: formr's upload replaces the run's
+    structure and expires every participant's current unit session. Over
     stdio the tools use the workspace files as before."""
     uploaded: list[str] = []
     if not HTTP_MODE:
         yield uploaded
         return
     client = _client(ctx)
-    store = {name: await client.get_run_structure(name)}
-    fetched = store[name]
-    reset = MEMORY_STRUCTURES.set(store)
+    lock = _run_edit_lock(name) if upload else None
+    if lock is not None:
+        await lock.acquire()
     try:
-        yield uploaded
+        store = {name: await client.get_run_structure(name)}
+        fetched = store[name]
+        reset = MEMORY_STRUCTURES.set(store)
+        try:
+            yield uploaded
+        finally:
+            MEMORY_STRUCTURES.reset(reset)
+        if upload and store[name] is not fetched:
+            if store[name] == fetched:
+                uploaded.append(f"Run '{name}' is unchanged: nothing was uploaded to formr.")
+            else:
+                uploaded.append(await _upload_structure(client, name, store[name]))
     finally:
-        MEMORY_STRUCTURES.reset(reset)
-    if upload and store[name] is not fetched:
-        uploaded.append(await _upload_structure(client, name, store[name]))
+        if lock is not None:
+            lock.release()
 
 
 def _with_upload(result: str, uploaded: list[str]) -> str:
@@ -536,7 +589,12 @@ async def update_run_structure(name: RunName, structure_json: str, ctx: Context 
     if not isinstance(structure, dict) or "units" not in structure:
         raise ValueError("Run structure must be a JSON object with a 'units' array.")
 
-    return await _upload_structure(_client(ctx), name, structure)
+    client = _client(ctx)
+    if HTTP_MODE:
+        # not in the middle of a unit tool's fetch, edit, upload of this run
+        async with _run_edit_lock(name):
+            return await _upload_structure(client, name, structure)
+    return await _upload_structure(client, name, structure)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -1108,7 +1166,26 @@ _HTTP_WORKFLOW = """WORKFLOW — editing run structures (this server keeps no fi
   The unit tools (add_run_unit, remove_run_unit, duplicate_run_units, shift_run_positions,
   renormalize_positions) fetch the run, edit, validate and upload it in one step; summarize_run,
   find_run_items and analyze_run read it from formr. Upload files with upload_run_file(text=…)
-  or content_base64."""
+  or content_base64.
+  Every upload (each unit tool's, update_run_structure's) replaces the run's whole structure in
+  formr at once and expires every participant's current unit session (one waiting at a Pause is
+  not moved on until they return). On a run with participants, make all changes in one
+  get_run_structure + update_run_structure, and tell the user first."""
+
+# Tools that upload a run structure over HTTP: each call replaces the live run.
+_HTTP_UPLOAD_TOOLS = ("add_run_unit", "remove_run_unit", "duplicate_run_units",
+                      "shift_run_positions", "renormalize_positions", "update_run_structure")
+
+# What the remaining tools' descriptions say about the stdio workspace, as the
+# hosted server has to say it (the file tools are not offered there).
+_HTTP_DESCRIPTION_EDITS = {
+    "get_run_structure": (" For editor/CLI workflows with file access, prefer\n"
+                          "    get_run_structure_to_file + update_run_structure_from_file (better for large runs).", ""),
+    "update_run_structure": (" For editor/CLI workflows, update_run_structure_from_file\n"
+                             "    is usually more convenient.", ""),
+    "get_pattern": ("analyze_run + update_run_structure_from_file", "analyze_run + update_run_structure"),
+    "add_run_unit": ("re-add it\n    to .formr/<name>.json before uploading", "add it\n    to the structure (get_run_structure + update_run_structure)"),
+}
 
 
 def configure_http_mode() -> None:
@@ -1119,6 +1196,17 @@ def configure_http_mode() -> None:
     HTTP_MODE = True
     for tool in _LOCAL_ONLY_TOOLS:
         mcp.remove_tool(tool)
+    # the tools are replaced by edited copies, not changed in place
+    tools = mcp._tool_manager._tools
+    for name in _HTTP_UPLOAD_TOOLS:
+        tool = tools[name]
+        tools[name] = tool.model_copy(update={"annotations": (tool.annotations or ToolAnnotations()).model_copy(
+            update={"destructiveHint": True})})
+    for name, (old, new) in _HTTP_DESCRIPTION_EDITS.items():
+        tool = tools[name]
+        if old not in (tool.description or ""):
+            raise RuntimeError(f"configure_http_mode: the description of {name} no longer says {old!r}")
+        tools[name] = tool.model_copy(update={"description": tool.description.replace(old, new)})
     text = mcp._mcp_server.instructions
     setup_start = text.index("SETUP:")
     setup_end = text.index("CAPABILITIES & LIMITS:")
