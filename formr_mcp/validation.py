@@ -89,19 +89,19 @@ UNIT_SCHEMAS: dict[str, dict[str, list[str] | str]] = {
         "optional": ["description", "special", "study_id", "survey_data"],
         "description": "A survey/questionnaire presented to the participant (legacy v1 engine, one page per request).",
     },
-    # form_v2. A Form keeps its OWN survey_units row (type='Form') and points
-    # at its SurveyStudy through survey_units.form_study_id — unlike Survey,
-    # which shares its primary key with the study. Creating one stamps
-    # rendering_mode='v2' on the referenced study.
+    # form_v2. A Form is a Survey unit whose study is on v2: like a Survey it
+    # shares its study's primary key, and the study's own unit row says which
+    # it is. Placing a study as a Form changes neither its engine nor its items.
     "Form": {
         "required": ["type", "position"],
         "optional": ["description", "special", "study_id", "survey_data"],
         "description": (
             "A survey rendered by the form_v2 engine: the whole study is delivered as one "
             "AJAX single-page form (client-side showif, offline queue, optional Previous "
-            "button). Pass study_id to wire an existing study — creating the unit sets that "
-            "study's rendering_mode='v2'. NOTE: the run-structure export does not round-trip "
-            "a Form's study reference; see get_documentation('form-v2')."
+            "button). Pass study_id to place an existing study: it is a Form while that study "
+            "is on v2 (its rendering_mode, set in formr's survey settings), else a Survey; "
+            "placing it changes neither its engine nor its items. survey_data instead creates "
+            "the survey, on v2 unless its settings say otherwise. See get_documentation('form-v2')."
         ),
     },
     # Page and Endpage are the same unit type in formr (class Page, type 'Endpage').
@@ -257,14 +257,47 @@ def validate_survey_data(survey_data: object, unit_label: str) -> list[str]:
 
     if isinstance(settings, dict):
         # use_paging (0/1) is formr's own: a survey that pages comes back with
-        # it, and a run that has one must stay editable. Page breaks are
-        # 'submit' items (documentation), not this.
+        # it, and a run that has one must stay editable. A survey this upload
+        # may create gets none (validate_structure). Page breaks are 'submit'
+        # items (documentation), not this.
         if "page_items" in settings:
             errors.append(
                 f"{unit_label}: 'page_items' is not supported. "
                 f"Use 'submit' items in the item list to create page breaks."
             )
 
+    return errors
+
+
+def _new_surveys_with_custom_paging(units: list) -> list[str]:
+    """Custom Paging (survey_data.settings.use_paging) for a survey this upload
+    may create: formr applies a survey's settings only when it makes the
+    survey, and can't turn Custom Paging off again. A survey another unit sends
+    with its run_unit_id is one formr has, and keeps its settings: a round trip
+    of a survey that pages, and a copy of its unit, stay editable."""
+    def survey_data(unit):
+        if isinstance(unit, dict) and unit.get("type") in SURVEY_UNIT_TYPES and isinstance(unit.get("survey_data"), dict):
+            return unit["survey_data"]
+        return None
+
+    def name(data):
+        return data.get("name") if isinstance(data.get("name"), str) else None
+
+    placed = {name(survey_data(u)) for u in units if survey_data(u) is not None and "run_unit_id" in u}
+    errors = []
+    for unit in units:
+        data = survey_data(unit)
+        if data is None or "run_unit_id" in unit or (name(data) is not None and name(data) in placed):
+            continue
+        settings = data.get("settings")
+        if isinstance(settings, dict) and settings.get("use_paging") not in (None, 0, "0", False, ""):
+            errors.append(
+                f"{unit.get('type')} unit at position {unit.get('position')}: 'use_paging' must be 0 or omitted "
+                f"on a survey this upload may create (sent without a run_unit_id). Custom Paging is legacy "
+                f"and unsupported, and formr can't turn it off again: use 'submit' items in the item list "
+                f"to create page breaks. A survey formr already has keeps its own settings and ignores "
+                f"this one, so leaving it out changes nothing there."
+            )
     return errors
 
 
@@ -385,6 +418,8 @@ def validate_structure(data: dict) -> list[str]:
                     f"Wait unit at position {pos}: 'body'={body!r} (where a participant who "
                     f"comes back early is sent) does not match any unit position"
                 )
+
+    errors.extend(_new_surveys_with_custom_paging(units))
 
     if positions:
         first_pos = min(p for p in positions if isinstance(p, int))

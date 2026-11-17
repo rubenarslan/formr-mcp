@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import server as server_mod
 from formr_mcp import utils
 from formr_mcp.auth import FormrTokenVerifier, FormrUnavailable
-from formr_mcp.client import FormrAuthExpired, FormrClient, FormrClientError, FormrConflict
+from formr_mcp.client import FormrAnswerLost, FormrAuthExpired, FormrClient, FormrClientError, FormrConflict
 
 BASE = "https://formr.example.org"
 MCP_URL = BASE + "/mcp"
@@ -311,9 +311,13 @@ class TestNoWorkspace:
     def test_an_upload_made_from_an_old_copy_says_fetch_again(self, http_mode):
         c = self._client(http_mode)
         c.put_run_structure.side_effect = FormrConflict("PUT ... -> 409", {"message": "...", "version": "abc"})
-        with pytest.raises(ValueError, match="has changed in formr since it was fetched"):
+        with pytest.raises(ValueError, match="units or settings have changed in formr since it was fetched") as stale:
             _run(server_mod.update_run_structure("demo", json.dumps({"version": "old", "units": [
                 {"type": "Pause", "position": 5, "wait_minutes": 1}]}), ctx=MagicMock()))
+        assert "update_run_settings" in str(stale.value) and "Fetch it again" in str(stale.value)
+        # a unit tool fetches by itself: the run changed while it ran
+        with pytest.raises(ValueError, match="changed while this tool ran: call the tool again"):
+            _run(server_mod.add_run_unit("demo", "Pause", 5, unit_fields={"wait_minutes": 1}, ctx=MagicMock()))
 
     def test_a_change_formr_applied_is_not_reported_as_failed(self, http_mode):
         c = self._client(http_mode)
@@ -477,3 +481,177 @@ class TestHostedServer:
             assert "_from_file" not in tools[name]["description"] and ".formr/" not in tools[name]["description"], name
         for name in ("add_run_unit", "remove_run_unit", "renormalize_positions", "update_run_structure"):
             assert tools[name]["annotations"]["destructiveHint"] is True, name
+
+
+class TestOverwritesAndLostAnswers:
+    """An overwrite that formr keeps in place still replaces the unit; a Form and
+    a Survey of one study are one unit to formr; an upload whose answer is lost
+    may have landed; another researcher's calls don't hold up a run's owner."""
+
+    STRUCTURE = TestNoWorkspace.STRUCTURE
+    _client = TestNoWorkspace._client
+
+    def test_an_overwrite_replaces_the_unit_it_keeps(self, http_mode):
+        c = self._client(http_mode, {"name": "demo", "units": [
+            {"type": "Pause", "position": 5, "description": "wait", "body": "Come back tomorrow",
+             "wait_minutes": 1440, "wait_until_time": None, "wait_until_date": None,
+             "relative_to": "diary$created", "run_unit_id": 7},
+            {"type": "Endpage", "position": 10, "body": "Bye", "run_unit_id": 8}]})
+        _run(server_mod.add_run_unit("demo", "Pause", 5, insert_mode="overwrite",
+                                     unit_fields={"wait_until_time": "10:00"}, ctx=MagicMock()))
+        pause = c.put_run_structure.await_args.args[1]["units"][0]
+        # formr keeps what an upload leaves out of a unit it keeps: the old wait and text go
+        assert pause["run_unit_id"] == 7
+        assert (pause["wait_until_time"], pause["wait_minutes"], pause["relative_to"], pause["body"]) == \
+            ("10:00", None, None, "")
+
+    def test_a_form_overwritten_as_a_survey_of_its_study_stays(self, http_mode):
+        c = self._client(http_mode, {"name": "demo", "units": [
+            {"type": "Form", "position": 5, "description": "diary", "run_unit_id": 7},
+            {"type": "Endpage", "position": 10, "body": "Bye", "run_unit_id": 8}]})
+        _run(server_mod.add_run_unit("demo", "Survey", 5, insert_mode="overwrite",
+                                     unit_fields={"study_id": 30}, ctx=MagicMock()))
+        survey = c.put_run_structure.await_args.args[1]["units"][0]
+        assert survey["run_unit_id"] == 7, "formr decides by the study whether it is the same placement"
+        assert "body" not in survey
+
+    def test_an_overwrite_can_confirm_a_removal(self, http_mode):
+        c = self._client(http_mode)
+        _run(server_mod.add_run_unit("demo", "Pause", 10, insert_mode="overwrite",
+                                     unit_fields={"wait_minutes": 1}, confirm_removal=True, ctx=MagicMock()))
+        assert c.put_run_structure.await_args.kwargs["confirm_removal"] is True
+
+    @pytest.mark.parametrize("lost", [FormrAnswerLost("PUT api/v1/runs/demo/structure: formr's answer was lost"),
+                                      FormrClientError("PUT api/v1/runs/demo/structure -> 502: Bad Gateway", status=502)])
+    def test_an_upload_whose_answer_is_lost_may_have_landed(self, http_mode, lost):
+        c = self._client(http_mode)
+        put = c.put_run_structure.side_effect
+
+        async def put_then_lose(name, structure, confirm_removal=False):
+            await put(name, structure, confirm_removal)
+            raise lost
+        c.put_run_structure.side_effect = put_then_lose
+        with pytest.raises(ValueError, match="may have applied it"):
+            _run(server_mod.add_run_unit("demo", "Pause", 5, unit_fields={"wait_minutes": 1}, ctx=MagicMock()))
+
+    def test_a_refusal_is_passed_on_as_it_is(self, http_mode):
+        c = self._client(http_mode)
+        c.put_run_structure.side_effect = FormrClientError("PUT ... -> 400: Import failed", status=400)
+        with pytest.raises(FormrClientError, match="400"):
+            _run(server_mod.add_run_unit("demo", "Pause", 5, unit_fields={"wait_minutes": 1}, ctx=MagicMock()))
+
+    def test_a_read_back_that_fails_says_not_to_repeat_the_change(self, http_mode):
+        c = self._client(http_mode)
+        get = c.get_run_structure.side_effect
+        calls = []
+
+        async def get_once(name):
+            calls.append(name)
+            if len(calls) > 1:
+                raise httpx.ConnectError("Connection refused")
+            return await get(name)
+        c.get_run_structure.side_effect = get_once
+        with pytest.raises(ValueError, match="Do not repeat"):
+            _run(server_mod.add_run_unit("demo", "Pause", 5, unit_fields={"wait_minutes": 1}, ctx=MagicMock()))
+
+    def test_a_refused_removal_names_the_surveys_saved_all_the_same(self, http_mode):
+        c = self._client(http_mode)
+        c.put_run_structure.side_effect = FormrConflict("PUT ... -> 409", {
+            "message": "...", "units_in_use": [{"run_unit_id": 8, "position": 10, "type": "Page", "participants": 3}],
+            "surveys_saved": ["diary"]})
+        with pytest.raises(ValueError) as refused:
+            _run(server_mod.update_run_structure("demo", json.dumps({"units": [
+                {"type": "Pause", "position": 5, "wait_minutes": 1}]}), ctx=MagicMock()))
+        assert "diary" in str(refused.value) and "nothing was uploaded" not in str(refused.value)
+
+    def test_edit_locks_are_each_accounts_own(self):
+        mine = server_mod._run_edit_lock("some-run", "5")
+        assert server_mod._run_edit_lock("SOME-run", "5") is mine
+        assert server_mod._run_edit_lock("some-run", "6") is not mine, "another researcher's calls don't wait for it"
+        ctx = SimpleNamespace(request_context=SimpleNamespace(request=SimpleNamespace(
+            user=SimpleNamespace(access_token=SimpleNamespace(subject="5")))))
+        assert server_mod._caller_account(ctx) == "5"
+        assert server_mod._caller_account(None) == ""
+
+    def test_a_dropped_connection_is_a_lost_answer(self):
+        def handler(request):
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        client = FormrClient(BASE, http_client=_formr(handler), access_token=TOKEN)
+        with pytest.raises(FormrAnswerLost):
+            _run(client.put_run_structure("demo", {"units": []}))
+
+
+class TestHostedToolsSayWhatTheyDo:
+    """whoami's map and the hosted server's tool descriptions match what each
+    tool does there; analyze_run keeps the event loop free."""
+    STRUCTURE = TestNoWorkspace.STRUCTURE
+    _client = TestNoWorkspace._client
+
+    def test_a_settings_update_needs_run_read_too(self, monkeypatch):
+        monkeypatch.setattr(server_mod, "HTTP_MODE", True)
+        report = server_mod._build_capability_report({"scopes": ["run:write"]}, ["run:write"])
+        assert report["tool_access"]["update_run_settings"].startswith("blocked: requires 'run:read'")
+        monkeypatch.setattr(server_mod.gate, "data_access_mode", lambda: server_mod.gate.TEST_ONLY)
+        report = server_mod._build_capability_report({"scopes": ["data:read"]}, ["data:read"])
+        assert "session:read" in report["tool_access"]["get_run_results"]
+
+    def test_a_saved_setting_is_no_failure_without_run_read(self, monkeypatch):
+        c = AsyncMock()
+        c.get_run.side_effect = server_mod.FormrPermissionError("GET ... 403")
+        monkeypatch.setattr(server_mod, "_client", lambda ctx: c)
+        out = _run(server_mod.update_run_settings("demo", {"title": "New"}, ctx=MagicMock()))
+        c.patch_run.assert_awaited_once()
+        assert out["updated"] == ["title"] and "Saved" in out["note"]
+
+    def test_hosted_descriptions_offer_no_workspace(self, monkeypatch):
+        tools = dict(server_mod.mcp._tool_manager._tools)
+        instructions = server_mod.mcp._mcp_server.instructions
+        monkeypatch.setattr(server_mod, "HTTP_MODE", False)
+        try:
+            server_mod.configure_http_mode()
+            hosted = server_mod.mcp._tool_manager._tools
+            for name in ("upload_run_file", "fetch_google_sheet", "summarize_run", "remove_run_unit",
+                         "duplicate_run_units", "shift_run_positions"):
+                description = hosted[name].description
+                assert "workspace" not in description and ".formr" not in description and "local" not in description, name
+            assert "path" not in hosted["upload_run_file"].parameters["properties"]
+            assert "to_file" not in hosted["fetch_google_sheet"].parameters["properties"]
+            assert hosted["fetch_google_sheet"].parameters["properties"]["format"]["enum"] == ["csv"]
+            assert "from the workspace" not in server_mod.mcp._mcp_server.instructions
+        finally:
+            server_mod.mcp._tool_manager._tools.clear()
+            server_mod.mcp._tool_manager._tools.update(tools)
+            server_mod.mcp._mcp_server.instructions = instructions
+
+    def test_analyze_run_keeps_the_event_loop_free(self, http_mode):
+        import time
+        self._client(http_mode)
+        seen = []
+
+        def slow_analysis(name):
+            # R's syntax check, one process per expression, in a thread now
+            seen.append(utils.load_structure(name)["units"][0]["type"])
+            time.sleep(0.3)
+            return "report"
+        http_mode.setattr(server_mod, "run_analysis", slow_analysis)
+
+        async def both():
+            # another researcher's call, already going while this one analyses
+            ticks = []
+            done = asyncio.Event()
+
+            async def heartbeat():
+                while True:
+                    ticks.append(time.monotonic())
+                    if done.is_set():
+                        return
+                    await asyncio.sleep(0.01)
+            beat = asyncio.create_task(heartbeat())
+            await asyncio.sleep(0.03)
+            report = await server_mod.analyze_run("demo", ctx=MagicMock())
+            done.set()
+            await beat
+            return report, ticks
+        report, ticks = _run(both())
+        assert report == "report" and seen == ["Endpage"], "the thread sees the structure fetched for the call"
+        assert max(b - a for a, b in zip(ticks, ticks[1:])) < 0.2, "no 0.3 s stall"

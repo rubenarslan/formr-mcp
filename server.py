@@ -27,6 +27,7 @@ load_dotenv(dotenv_path)
 
 from formr_mcp.auth import AuthError, check_credentials
 from formr_mcp.client import (
+    FormrAnswerLost,
     FormrAuthExpired,
     FormrClient,
     FormrClientError,
@@ -113,6 +114,8 @@ _ALSO_NEEDS = {
     "create_test_sessions": "run:read",
     "upload_run_file": "file:read",
     "test_session_action": "session:read",
+    # it answers with the run as saved (GET), after the PATCH
+    "update_run_settings": "run:read",
 }
 
 
@@ -158,6 +161,10 @@ def _build_capability_report(caps: dict, token_scopes: list[str]) -> dict:
                 tool_access[tool] = f"blocked: requires '{scope}' scope"
         elif tool in _ALSO_NEEDS and _ALSO_NEEDS[tool] not in scope_set:
             tool_access[tool] = f"blocked: requires '{_ALSO_NEEDS[tool]}' and '{scope}' scopes"
+        elif tool == "get_run_results" and mode == gate.TEST_ONLY and "session:read" not in scope_set:
+            # test_only finds the run's test sessions first (data_access.get_results_gated)
+            tool_access[tool] = ("blocked: requires 'session:read' and 'data:read' scopes "
+                                 "(FORMR_DATA_ACCESS=test_only looks up the test sessions first)")
         elif tool in ("get_run_results", "get_run_logs") and mode == gate.TEST_ONLY:
             tool_access[tool] = "available: TEST sessions only (FORMR_DATA_ACCESS=test_only)"
         else:
@@ -393,11 +400,16 @@ async def update_run_settings(name: RunName, settings: dict, ctx: Context = None
     if HTTP_MODE:
         # not in the middle of a unit tool's fetch, edit, upload of this run,
         # whose upload carries the run's settings as they were
-        async with _run_edit_lock(name):
+        async with _run_edit_lock(name, _caller_account(ctx)):
             await client.patch_run(name, settings)
     else:
         await client.patch_run(name, settings)
-    return await client.get_run(name)
+    try:
+        return await client.get_run(name)
+    except FormrPermissionError:
+        # saved all the same: a 403 here was taken for a failed save, and repeated
+        return {"name": name, "updated": sorted(settings),
+                "note": "Saved. Reading the run back needs the 'run:read' scope, which this token lacks."}
 
 
 def _format_size(bytes: int) -> str:
@@ -471,11 +483,13 @@ def _unit_signature(structure: dict) -> list[tuple]:
 
 async def _upload_structure(client: FormrClient, name: str, structure: dict,
                             confirm_removal: bool = False,
-                            confirm_hint: str = "upload again with confirm_removal=true") -> tuple[str, dict]:
+                            confirm_hint: str = "upload again with confirm_removal=true",
+                            stale_hint: str = "Fetch it again and make the change on that") -> tuple[str, dict]:
     """Validate a run structure and PUT it, then check what formr stored.
     Returns the message and the stored structure (its new units now have
     their run_unit_id, and it carries formr's new version). confirm_hint: how
-    the caller's tool confirms a removal formr refused."""
+    the caller's tool confirms a removal formr refused; stale_hint: what it
+    does when formr says the copy is stale."""
     _normalize_survey_choices(structure)
     errors = validate_structure(structure)
     if errors:
@@ -487,23 +501,33 @@ async def _upload_structure(client: FormrClient, name: str, structure: dict,
     except FormrConflict as e:
         units = e.body.get("units_in_use")
         if units:
+            # formr saves a survey's changed items before the structure
+            saved = [str(s) for s in (e.body.get("surveys_saved") or [])]
+            done = ("nothing was uploaded" if not saved else
+                    "the run's units did not change, but the items of the survey(s) "
+                    f"{', '.join(saved)} were saved before that")
             raise ValueError(
-                f"Run '{name}': nothing was uploaded. It would remove units that participants are in: "
+                f"Run '{name}': {done}. It would remove units that participants are in: "
                 f"{_units_in_use(units)}. Their current step there would end, and they would go on to what "
                 "then stands in its place. If a unit was left out by mistake, keep it (with its run_unit_id). "
                 "Otherwise tell the user which units, and that participants are at them; only with their "
                 f"go-ahead, {confirm_hint}."
             ) from e
         if "version" in e.body:
+            # the version covers the run's units and settings (not its files)
             raise ValueError(
-                f"Run '{name}': nothing was uploaded. The run's structure has changed in formr since it was "
-                "fetched (in formr's editor, or by another upload). Fetch it again and make the change on "
-                "that; uploading the old copy would undo those changes."
+                f"Run '{name}': nothing was uploaded. The run's units or settings have changed in formr since "
+                "it was fetched (in formr's editor, by another upload, or by update_run_settings). "
+                f"{stale_hint}: uploading the old copy would undo those changes."
             ) from e
         raise
     except FormrClientError as e:
-        # a refusal (401, 403, 4xx) changed nothing; a time-out may have
-        if "timed out" in str(e):
+        # A refusal (401, 403, another 4xx, formr's own 500) changed nothing.
+        # An answer lost on the way back (a time-out, a dropped connection),
+        # or a proxy's 502-504 while formr_app restarted, may have come after
+        # formr applied it: the edit tools fetch afresh, so a retry would
+        # apply the change a second time.
+        if isinstance(e, FormrAnswerLost) or e.status in (502, 503, 504):
             raise ValueError(
                 f"Run '{name}': the upload's answer was lost ({e}). formr may have applied it: fetch the "
                 "structure and check before repeating the change, or it is made twice."
@@ -511,7 +535,7 @@ async def _upload_structure(client: FormrClient, name: str, structure: dict,
         raise
     try:
         stored = await client.get_run_structure(name)
-    except FormrClientError as e:
+    except (FormrClientError, httpx.HTTPError) as e:
         raise ValueError(
             f"Run '{name}': formr applied the upload ({_merge_summary(answer)}), but reading it back "
             f"failed ({e}). Do not repeat the change: fetch the structure to see it."
@@ -559,14 +583,27 @@ def _merge_summary(answer) -> str:
 # Over HTTP an edit of a run is fetch, edit, upload (a whole-structure PUT):
 # two at once (parallel tool calls) would both edit the same fetched
 # structure, and the later upload would drop the earlier edit. One edit of a
-# run at a time, in this process. A lock lives while a call holds it: the
-# map keeps no name nobody is editing.
-_RUN_EDIT_LOCKS: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
+# run at a time, in this process, per account: only its owner's connections
+# can edit a run, and another researcher's calls with its name (formr refuses
+# them, but only after they held the lock) must not hold the owner's edits
+# up. A lock lives while a call holds it: the map keeps no name nobody is
+# editing.
+_RUN_EDIT_LOCKS: "weakref.WeakValueDictionary[tuple, asyncio.Lock]" = weakref.WeakValueDictionary()
 
 
-def _run_edit_lock(name: str) -> asyncio.Lock:
+def _caller_account(ctx: Context | None) -> str:
+    """The formr account whose connection made this request (HTTP mode: the
+    token's subject, FormrTokenVerifier), or '' where there is none."""
+    try:
+        subject = ctx.request_context.request.user.access_token.subject
+    except (AttributeError, ValueError):  # no request: no caller
+        return ""
+    return str(subject) if isinstance(subject, (str, int)) else ""
+
+
+def _run_edit_lock(name: str, account: str = "") -> asyncio.Lock:
     validate_run_name(name)
-    key = name.lower()
+    key = (account, name.lower())
     lock = _RUN_EDIT_LOCKS.get(key)
     if lock is None:
         lock = _RUN_EDIT_LOCKS[key] = asyncio.Lock()
@@ -589,7 +626,7 @@ async def _run_structure(ctx: Context, name: str, *, upload: bool = False, confi
         yield uploaded
         return
     client = _client(ctx)
-    lock = _run_edit_lock(name) if upload else None
+    lock = _run_edit_lock(name, _caller_account(ctx)) if upload else None
     if lock is not None:
         await lock.acquire()
     try:
@@ -605,7 +642,8 @@ async def _run_structure(ctx: Context, name: str, *, upload: bool = False, confi
                 uploaded.append(f"Run '{name}' is unchanged: nothing was uploaded to formr.")
             else:
                 message, _ = await _upload_structure(client, name, store[name], confirm_removal=confirm_removal,
-                                                     confirm_hint=confirm_hint)
+                                                     confirm_hint=confirm_hint,
+                                                     stale_hint="It changed while this tool ran: call the tool again")
                 uploaded.append(message)
     finally:
         if lock is not None:
@@ -712,7 +750,7 @@ async def update_run_structure(name: RunName, structure_json: str, confirm_remov
     client = _client(ctx)
     if HTTP_MODE:
         # not in the middle of a unit tool's fetch, edit, upload of this run
-        async with _run_edit_lock(name):
+        async with _run_edit_lock(name, _caller_account(ctx)):
             message, _ = await _upload_structure(client, name, structure, confirm_removal=confirm_removal,
                                                  confirm_hint="upload again with confirm_removal=true")
             return message
@@ -819,13 +857,16 @@ async def analyze_run(name: RunName, ctx: Context = None) -> str:
     """
     validate_run_name(name)
     async with _run_structure(ctx, name):
-        return run_analysis(name)
+        # off the event loop: its R syntax check starts R once per expression,
+        # which held up every other researcher's calls (a thread carries the
+        # structure fetched for this call, MEMORY_STRUCTURES, along)
+        return await asyncio.to_thread(run_analysis, name)
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_run_unit(name: RunName, unit_type: str, position: int, description: str = "",
                 insert_mode: Literal["shift", "overwrite"] = "shift",
-                unit_fields: dict | None = None, ctx: Context = None) -> str:
+                unit_fields: dict | None = None, confirm_removal: bool = False, ctx: Context = None) -> str:
     """Add a unit to a run structure. Locally the file must exist (fetch with get_run_structure_to_file first); a hosted server edits the run in formr, validated and uploaded in one step.
 
     unit_fields — unit-type-specific fields (see get_unit_types() for full schema):
@@ -839,11 +880,16 @@ async def add_run_unit(name: RunName, unit_type: str, position: int, description
       Pause: wait_minutes, wait_until_time, wait_until_date, relative_to
 
     insert_mode: 'shift' (default) shifts units at >= position up by 10; 'overwrite' replaces
-    (a unit of the same type in place, keeping its participants). Position references are
-    auto-remapped. See get_documentation("form-v2") for Form units.
+    the unit there: one of the same kind (a Page/Endpage, a Survey/Form of the same study) in
+    place, keeping its participants, with every field not given set as a new unit has it;
+    one of another kind is removed. Position references are auto-remapped. See
+    get_documentation("form-v2") for Form units.
+    Hosted, formr refuses an overwrite that removes a unit participants are at unless
+    confirm_removal=True: tell the user, and pass it only with their go-ahead.
     """
     validate_run_name(name)
-    async with _run_structure(ctx, name, upload=True) as uploaded:
+    async with _run_structure(ctx, name, upload=True, confirm_removal=confirm_removal,
+                              confirm_hint="call add_run_unit again with confirm_removal=true") as uploaded:
         result = editing_add_run_unit(name, unit_type, position, description=description,
                                       insert_mode=insert_mode, **(unit_fields or {}))
     return _with_upload(result, uploaded)
@@ -1311,12 +1357,35 @@ _HTTP_UPLOAD_TOOLS = ("add_run_unit", "remove_run_unit", "duplicate_run_units",
 
 # What the remaining tools' descriptions say about the stdio workspace, as the
 # hosted server has to say it (the file tools are not offered there).
+# Each (old, new) must still be in the description: a reworded docstring stops
+# the server's start rather than go on advertising the workspace.
 _HTTP_DESCRIPTION_EDITS = {
-    "get_run_structure": (" For editor/CLI workflows with file access, prefer\n"
-                          "    get_run_structure_to_file + update_run_structure_from_file (better for large runs).", ""),
-    "update_run_structure": (" For editor/CLI\n"
-                             "    workflows, update_run_structure_from_file is usually more convenient.", ""),
-    "get_pattern": ("analyze_run + update_run_structure_from_file", "analyze_run + update_run_structure"),
+    "get_run_structure": [(" For editor/CLI workflows with file access, prefer\n"
+                           "    get_run_structure_to_file + update_run_structure_from_file (better for large runs).", "")],
+    "update_run_structure": [(" For editor/CLI\n"
+                              "    workflows, update_run_structure_from_file is usually more convenient.", "")],
+    "get_pattern": [("analyze_run + update_run_structure_from_file", "analyze_run + update_run_structure")],
+    "upload_run_file": [("      path            a file in the MCP workspace (FORMR_WORKSPACE_DIR, default .formr/),\n"
+                         "                      relative to it or absolute inside it; nothing outside is read\n", "")],
+    "fetch_google_sheet": [
+        (" Set to_file=True to instead write\n      a .csv into the workspace (.formr/sheets/) and return its path.", ""),
+        ('    - format="xlsx": the whole workbook is binary, so it is always written to a\n'
+         "      file in the workspace and the path is returned (to_file is implied).\n", ""),
+        ("read the\n    CSV here to inspect/convert, or grab the XLSX to upload via formr's survey\n    import.",
+         "read the\n    CSV here to inspect or convert it."),
+    ],
+    "summarize_run": [("Summarize a run structure from the local file.", "Summarize a run's structure.")],
+    "remove_run_unit": [("from the local run structure file.", "from a run's structure.")],
+    "duplicate_run_units": [("to_start_position in the local run structure file.", "to_start_position in a run's structure.")],
+    "shift_run_positions": [("by delta in the local run structure file.", "by delta in a run's structure.")],
+}
+
+# Parameters a hosted server has no use for (it has no workspace): left out of
+# the tools' input schemas (None), or narrowed; a call that sends them anyway
+# is refused by the tool.
+_HTTP_PARAMETER_EDITS = {
+    "upload_run_file": {"path": None},
+    "fetch_google_sheet": {"to_file": None, "format": {"enum": ["csv"]}},
 }
 
 
@@ -1334,11 +1403,25 @@ def configure_http_mode() -> None:
         tool = tools[name]
         tools[name] = tool.model_copy(update={"annotations": (tool.annotations or ToolAnnotations()).model_copy(
             update={"destructiveHint": True})})
-    for name, (old, new) in _HTTP_DESCRIPTION_EDITS.items():
-        tool = tools[name]
-        if old not in (tool.description or ""):
-            raise RuntimeError(f"configure_http_mode: the description of {name} no longer says {old!r}")
-        tools[name] = tool.model_copy(update={"description": tool.description.replace(old, new)})
+    for name, edits in _HTTP_DESCRIPTION_EDITS.items():
+        description = tools[name].description or ""
+        for old, new in edits:
+            if old not in description:
+                raise RuntimeError(f"configure_http_mode: the description of {name} no longer says {old!r}")
+            description = description.replace(old, new)
+        tools[name] = tools[name].model_copy(update={"description": description})
+    for name, changes in _HTTP_PARAMETER_EDITS.items():
+        schema = json.loads(json.dumps(tools[name].parameters))
+        for param, change in changes.items():
+            if param not in schema.get("properties", {}):
+                raise RuntimeError(f"configure_http_mode: {name} no longer has a parameter {param!r}")
+            if change is None:
+                del schema["properties"][param]
+                if param in schema.get("required", []):
+                    schema["required"].remove(param)
+            else:
+                schema["properties"][param].update(change)
+        tools[name] = tools[name].model_copy(update={"parameters": schema})
     text = mcp._mcp_server.instructions
     setup_start = text.index("SETUP:")
     setup_end = text.index("CAPABILITIES & LIMITS:")
@@ -1346,7 +1429,10 @@ def configure_http_mode() -> None:
     flow_start = text.index("WORKFLOW — editing run structures")
     flow_end = text.index("PATTERNS —")
     text = text[:flow_start] + _HTTP_WORKFLOW + "\n\n" + text[flow_end:]
-    text = text.replace("upload_run_file (from the workspace, text or base64)", "upload_run_file (text or base64)")
+    old = "upload_run_file (from the workspace, text or base64)"
+    if old not in text:
+        raise RuntimeError(f"configure_http_mode: the instructions no longer say {old!r}")
+    text = text.replace(old, "upload_run_file (text or base64)")
     mcp._mcp_server.instructions = text
 
 

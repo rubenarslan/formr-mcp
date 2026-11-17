@@ -33,6 +33,16 @@ from .auth import AuthError, OAuthToken, get_token
 
 
 class FormrClientError(Exception):
+    """`status` is formr's HTTP status where it answered, else None."""
+
+    def __init__(self, message: str = "", status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+class FormrAnswerLost(FormrClientError):
+    """The request reached formr but its answer did not come back (a read
+    timeout, a dropped connection): formr may have carried it out."""
     pass
 
 
@@ -137,7 +147,9 @@ class FormrClient:
         except httpx.TimeoutException as e:
             read_to = getattr(self._http.timeout, "read", None)
             log.warning("formr %s %s timed out after ~%ss", method, path, read_to)
-            raise FormrClientError(
+            # not connected: nothing was sent; else formr may have done it
+            lost = not isinstance(e, (httpx.ConnectTimeout, httpx.PoolTimeout))
+            raise (FormrAnswerLost if lost else FormrClientError)(
                 f"{method} {path} timed out (client limit ~{read_to}s). The formr server "
                 "accepted the connection but did not respond in time. If reads (e.g. get_run) "
                 "are instant but this WRITE hangs, the instance is stalling on the write itself "
@@ -146,6 +158,11 @@ class FormrClient:
                 "slow OpenCPU render — not the MCP or your token. Raise FORMR_HTTP_TIMEOUT to "
                 "wait longer, and check the instance's DB locks (SHOW PROCESSLIST) and logs."
             ) from e
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError) as e:
+            # sent, and the connection went before the answer (formr_app
+            # restarting, a proxy cut): formr may have carried it out
+            log.warning("formr %s %s: no answer (%s)", method, path, type(e).__name__)
+            raise FormrAnswerLost(f"{method} {path}: formr's answer was lost ({type(e).__name__}: {e}).") from e
 
         log.info("formr %s %s -> %s (%.0fms)", method, path, resp.status_code,
                  (time.perf_counter() - t0) * 1000)
@@ -177,7 +194,7 @@ class FormrClient:
         if not resp.is_success:
             body = resp.text[:500]
             raise FormrClientError(
-                f"{method} {path} -> {resp.status_code}: {body}"
+                f"{method} {path} -> {resp.status_code}: {body}", status=resp.status_code
             )
 
         ct = resp.headers.get("content-type", "")

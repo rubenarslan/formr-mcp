@@ -33,11 +33,26 @@ class TestSurveyDataSettings:
         return unit
 
     def test_a_survey_that_pages_stays_editable(self):
-        # formr exports use_paging (0/1); a run with such a survey must pass
+        # formr exports use_paging (0/1); a run with such a survey must pass,
+        # and so must a copy of its unit
         items = [{"type": "note", "name": "n1", "label": "Hi", "optional": 1}]
         for value in (1, "1"):
             unit = self._make_survey_unit("demo", items, {"use_paging": value})
-            assert validate_structure({"units": [unit]}) == []
+            unit["run_unit_id"] = 7
+            copy = {k: v for k, v in unit.items() if k != "run_unit_id"}
+            copy["position"] = 20
+            assert validate_structure({"units": [unit, copy]}) == []
+
+    def test_a_new_survey_gets_no_custom_paging(self):
+        # formr applies a survey's settings only when it makes it, and can't
+        # turn Custom Paging off again
+        items = [{"type": "note", "name": "n1", "label": "Hi", "optional": 1}]
+        for value in (1, "1", True):
+            unit = self._make_survey_unit("demo", items, {"use_paging": value})
+            errors = validate_structure({"units": [unit]})
+            assert len(errors) == 1 and "use_paging" in errors[0] and "submit" in errors[0], errors
+        for value in (0, "0", None):
+            assert validate_structure({"units": [self._make_survey_unit("demo", items, {"use_paging": value})]}) == []
 
     def test_v2_recording_items_are_known(self):
         items = [{"type": t, "name": f"i{n}", "label": "x", "optional": 1}

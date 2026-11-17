@@ -325,7 +325,7 @@ The participant moves from one position to the next unless a branch redirects th
   If `TRUE`, the participant jumps to the `if_true` position. There is no `Branch` unit type:
   formr's importer rejects it — use `SkipForward` for a forward branch.
 - **Surveys collect data** — a `Survey` unit links to a survey definition (either existing `study_id` or inline `survey_data`).
-- **Forms are surveys on the new engine** — a `Form` unit renders the same survey definition through form_v2: one AJAX single-page document, client-side `showif`, an offline queue. It links to its study through `study_id` and stamps `rendering_mode='v2'` on it. See `get_documentation("form-v2")` before using one — the export/import round-trip has a sharp edge.
+- **Forms are surveys on the new engine** — a `Form` unit renders the same survey definition through form_v2: one AJAX single-page document, client-side `showif`, an offline queue. It is a `Survey` unit whose study is on v2 (`rendering_mode='v2'`, set in formr's survey settings): placing a study as a `Form` does not switch its engine. See `get_documentation("form-v2")` before using one.
 - **Emails are sent automatically** — `Email` units fire when reached (or on cron for `cron_only=1`).
 - **Pauses wait** — `Pause` units stall progress until a time, date, or duration passes. No user interaction; the page displays the `body` content.
 - **Waits are interactive pauses** — `Wait` units also stall progress, but participants can click through to advance early. The `body` field stores the **position number** to jump to on click.
@@ -998,7 +998,7 @@ Most settings default to `0`/`false`. The key ones:
 - `hide_results` — hide results from participants
 
 **Forbidden settings:**
-- `use_paging` — Do NOT set this to 1. Custom Paging is a legacy feature that is no longer supported. Use `submit` items in the item list to create page breaks instead.
+- `use_paging` — Do NOT set this to 1. Custom Paging is a legacy feature that is no longer supported. Use `submit` items in the item list to create page breaks instead. formr applies it only when an upload creates the survey, and can't turn it off again, so an upload is refused that would create a survey with it; a survey that already pages exports it as 1, which an upload may send back unchanged.
 - `page_items` — Do NOT use. This is part of the legacy Custom Paging feature. Use `submit` items to create page breaks.
 - `use_material_design` — Do NOT set this to 1. Material Design is a legacy theme that is not supported. Use `custom_css` to style the survey instead.
 
@@ -2728,8 +2728,9 @@ These live on the study (`survey_studies`), not on the unit:
 `survey_data.settings`, but formr's import allowlist
 (`SurveyStudy::createFromData`) does not include them — uploading a changed
 value is silently ignored. Change them in the admin UI
-(`/admin/survey/<name>` → "Form_v2 settings"), or by creating a `Form` unit
-(which sets `rendering_mode='v2'`).
+(`/admin/survey/<name>` → "Form_v2 settings"); a new survey sent as a `Form`
+unit's `survey_data` is created on v2. Placing an existing study as a `Form`
+changes nothing.
 
 `language` only translates the engine's own chrome (nav buttons, save pill,
 offline banners, validation fallbacks). Item labels and choices are whatever the
@@ -2877,9 +2878,10 @@ default) is new alongside form_v2 but renders in **both** engines. See
 3. Decide `offline_mode`, `allow_previous`, `layout`, `language`.
 4. If the study uses `add_to_home_screen` / `push_notification`, configure the
    run as an installable PWA and check `/{run}/manifest` responds.
-5. Swap the `Survey` unit for a `Form` unit pointing at the study (this sets
-   `rendering_mode='v2'`), then walk every page via the run's "use as yourself"
-   link.
+5. Switch the study to v2 in formr (`/admin/survey/<name>` → "Form_v2 settings",
+   rendering mode v2): its unit then shows as a `Form` by itself (placing it as a
+   `Form` unit does not switch it). Then walk every page via the run's "use as
+   yourself" link.
 
 ## Known limitations vs. v1
 

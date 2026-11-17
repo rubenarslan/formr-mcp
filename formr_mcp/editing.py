@@ -140,6 +140,34 @@ def _build_unit(unit_type: str, position: int, **kwargs) -> dict:
     return unit
 
 
+def _unit_kind(unit_type: str | None) -> str | None:
+    """formr's "same kind of unit" for a placement it keeps (Run::isSamePlacedUnit):
+    a Page and an Endpage are one, so are a Survey and a Form (the study decides)."""
+    return {"Endpage": "Page", "Form": "Survey"}.get(unit_type, unit_type)
+
+
+# What a new unit of each type has in the fields formr exports for it, which
+# a structure upload leaves as they are on a unit formr keeps (Run::saveKeptUnit):
+# an overwrite that keeps the unit sends these for the fields it isn't given.
+# Not None throughout: formr refuses NULL for some (a PushMessage's priority, an
+# Email's cron_only). A survey or form keeps its study and takes only the description.
+_NEW_UNIT_FIELDS: dict[str, dict[str, Any]] = {
+    "Pause": {"body": "", "wait_until_time": None, "wait_until_date": None,
+              "wait_minutes": None, "relative_to": None},
+    "Email": {"subject": None, "account_id": None, "recipient_field": None, "body": None, "cron_only": 0},
+    "External": {"address": None, "api_end": 0, "expire_after": 0},
+    "Page": {"body": None, "title": None},
+    "PushMessage": {"message": "", "topic": None, "priority": "normal", "time_to_live": 86400,
+                    "badge_count": 1, "vibrate": 1, "require_interaction": 0, "renotify": 0, "silent": 0},
+    "SkipForward": {"automatically_jump": 1, "automatically_go_on": 1},
+    "SkipBackward": {"automatically_jump": 1, "automatically_go_on": 1},
+    "Shuffle": {"groups": 2},
+    "Privacy": {"privacy_label": "", "tos_label": ""},
+}
+_NEW_UNIT_FIELDS["Wait"] = _NEW_UNIT_FIELDS["Pause"]
+_NEW_UNIT_FIELDS["Endpage"] = _NEW_UNIT_FIELDS["Page"]
+
+
 # ── Public API ────────────────────────────────────────────────────────
 
 def add_run_unit(name: str, unit_type: str, position: int, **kwargs) -> str:
@@ -167,11 +195,15 @@ def add_run_unit(name: str, unit_type: str, position: int, **kwargs) -> str:
             replaced = [u for u in units if u.get("position") == position]
             units = [u for u in units if u.get("position") != position]
             # the same kind of unit, changed: formr saves it in place, and
-            # whoever is at it stays (another type is a new unit)
-            same = {"Endpage": "Page"}
-            if (replaced and "run_unit_id" in replaced[0]
-                    and same.get(replaced[0].get("type"), replaced[0].get("type")) == same.get(unit_type, unit_type)):
+            # whoever is at it stays (another kind is a new unit; for a
+            # survey formr also asks that it is the same study)
+            if replaced and "run_unit_id" in replaced[0] and _unit_kind(replaced[0].get("type")) == _unit_kind(unit_type):
                 unit["run_unit_id"] = replaced[0]["run_unit_id"]
+                # formr keeps what an upload leaves out of a unit it keeps:
+                # the fields not given get a new unit's values, so that the
+                # overwrite replaces the unit, not just the fields given
+                for field, value in _NEW_UNIT_FIELDS.get(unit_type, {}).items():
+                    unit.setdefault(field, value)
         elif insert_mode == "shift":
             position_map = {}
             for u in units:
