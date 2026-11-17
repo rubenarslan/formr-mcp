@@ -67,7 +67,7 @@ def get_documentation(topic: str, section: str | None = None) -> str:
 
 # ── Item types ──────────────────────────────────────────────────────
 
-@_topic("item-types", "All 59 survey item types with fields")
+@_topic("item-types", "All 62 survey item types with fields")
 def _item_types():
     return r"""# Survey Item Types
 
@@ -232,6 +232,19 @@ Choices: **Forbidden**.
 | `push_notification` | TEXT | **Required** | Button to request push permission. Stores subscription JSON. |
 | `request_cookie` | VARCHAR(20) | **Required** | Button for functional cookie consent. |
 
+## Recording items: `data_quality`, `agent_probe`, `turnstile`
+
+- **`data_quality`** — a hidden field the participant's browser fills with the page's
+  automation and carelessness indicators (counts, durations) as one JSON object. Always
+  optional, gates nothing. One per page, before its submit; never on a consent page.
+- **`agent_probe`** — a note and a text field addressed to AI agents, hidden from people
+  (clipped to a pixel, out of the tab order). Any stored answer means something read the
+  page's text. `label` is the question, `choice1` the note.
+- **`turnstile`** — what Cloudflare Turnstile thinks of the participant (form_v2 only, and
+  only where the instance's administrator set up a widget for the mode): `turnstile`
+  (invisible, records), `turnstile non_interactive` (records; add `visible` to show it),
+  `turnstile managed` (a gate, unless optional).
+
 ## Bot check (form_v2)
 
 | Type | MySQL | Choices | type_options | Description |
@@ -312,7 +325,7 @@ The participant moves from one position to the next unless a branch redirects th
   If `TRUE`, the participant jumps to the `if_true` position. There is no `Branch` unit type:
   formr's importer rejects it — use `SkipForward` for a forward branch.
 - **Surveys collect data** — a `Survey` unit links to a survey definition (either existing `study_id` or inline `survey_data`).
-- **Forms are surveys on the new engine** — a `Form` unit renders the same survey definition through form_v2: one AJAX single-page document, client-side `showif`, an offline queue. It links to its study through `study_id` and stamps `rendering_mode='v2'` on it. See `get_documentation("form-v2")` before using one — the export/import round-trip has a sharp edge.
+- **Forms are surveys on the new engine** — a `Form` unit renders the same survey definition through form_v2: one AJAX single-page document, client-side `showif`, an offline queue. It is a `Survey` unit whose study is on v2 (`rendering_mode='v2'`, set in formr's survey settings): placing a study as a `Form` does not switch its engine. See `get_documentation("form-v2")` before using one.
 - **Emails are sent automatically** — `Email` units fire when reached (or on cron for `cron_only=1`).
 - **Pauses wait** — `Pause` units stall progress until a time, date, or duration passes. No user interaction; the page displays the `body` content.
 - **Waits are interactive pauses** — `Wait` units also stall progress, but participants can click through to advance early. The `body` field stores the **position number** to jump to on click.
@@ -985,7 +998,7 @@ Most settings default to `0`/`false`. The key ones:
 - `hide_results` — hide results from participants
 
 **Forbidden settings:**
-- `use_paging` — Do NOT set this to 1. Custom Paging is a legacy feature that is no longer supported. Use `submit` items in the item list to create page breaks instead.
+- `use_paging` — Do NOT set this to 1. Custom Paging is a legacy feature that is no longer supported. Use `submit` items in the item list to create page breaks instead. formr applies it only when an upload creates the survey, and can't turn it off again, so an upload is refused that would create a survey with it; a survey that already pages exports it as 1, which an upload may send back unchanged.
 - `page_items` — Do NOT use. This is part of the legacy Custom Paging feature. Use `submit` items to create page breaks.
 - `use_material_design` — Do NOT set this to 1. Material Design is a legacy theme that is not supported. Use `custom_css` to style the survey instead.
 
@@ -1698,34 +1711,61 @@ Each Survey unit defines its items inline as JSON objects.
 def _editing_tools():
     return r"""# Editing Tools for Run Structures
 
-## Workspace Directory
+## Two ways to work
 
-The MCP stores all run structure files in a `.formr/` directory. By default this
-is relative to the MCP server's working directory at startup, which varies by
-client (Claude Code, Cursor, OpenCode each launch from a different CWD). To pin
-it to a known absolute location, set `FORMR_WORKSPACE_DIR` in the `.env` file
-next to `server.py`:
+Which applies: on a **hosted** server (the formr instance's own, added to an app by
+its URL) the file tools `get_run_structure_to_file`, `update_run_structure_from_file`
+and `open_flowchart` are not offered; on a **local** server (run on the user's
+computer with an API credential) they are.
 
-    FORMR_WORKSPACE_DIR=/absolute/path/to/your/project/.formr
+**Hosted, or without file access** (a chat app such as Claude or ChatGPT):
 
-All tool messages (fetch, save, error) include the absolute path so you always
-know exactly where files are being read from and written to.
+1. `get_run_structure("run-name")` returns the structure as JSON text
+2. edit it in your reply, or use the programmatic editing tools below
+3. `update_run_structure("run-name", structure_json)` validates and uploads
 
-## Core Workflow: Fetch → Edit → Upload
+On a hosted server every editing tool below fetches the run from formr, edits it,
+validates it and uploads it in one call, and the inspection tools read the run
+from formr: each call changes the live run.
 
-Always use the file-based workflow. Do NOT pass large JSON structures through tool call arguments.
+**Local, with file access** (a coding agent or editor: Claude Code, Codex, Cursor,
+VS Code, OpenCode), for large runs:
 
-1. `get_run_structure_to_file("run-name")` — fetches to `.formr/run-name.json`
-2. Edit `.formr/run-name.json` with Read/Edit tools, or use the programmatic editing tools below
-3. `update_run_structure_from_file("run-name")` — validates and uploads
+1. `get_run_structure_to_file("run-name")` fetches to `.formr/run-name.json`
+2. edit that file with Read/Edit tools, or use the programmatic editing tools below
+3. `update_run_structure_from_file("run-name")` validates and uploads
 
-On success, the backup (`.formr/run-name.json.bak`) is auto-removed.
-On validation error, fix the file and retry. If stuck, restore from `.bak`.
+Locally the editing and inspection tools work on `.formr/<name>.json`: fetch it
+first. On success the backup (`.formr/run-name.json.bak`) is removed; on a
+validation error, fix the file and retry, or restore from `.bak`. The `.formr/`
+directory is relative to the server's working directory at startup, which differs
+between apps; `FORMR_WORKSPACE_DIR` in the `.env` next to `server.py` pins it, and
+every tool message names the absolute path.
+
+## Uploads keep participants in place
+
+formr (v2.0.0-rc13 and later) changes only what an upload changes:
+
+- Keep each unit's `run_unit_id` as fetched: formr keeps that unit, and its
+  participants stay on it, moving along when its position changes. Leave it out
+  for a new unit and never copy it to another (`duplicate_run_units` drops it).
+- Keep the structure's `version`: formr refuses an upload made from a copy that
+  changed in formr meanwhile. Fetch again and redo the change then.
+- A unit left out is removed, and its participants go on to whatever now stands
+  in its place. Where real participants are at it, formr refuses unless the call
+  passes `confirm_removal=true` (`remove_run_unit`, `update_run_structure`,
+  `update_run_structure_from_file`): name the units to the user and pass it only
+  with their go-ahead.
+- A survey's items are saved only where they differ from the survey's own, and
+  that needs the `survey:write` scope.
+
+An older formr (no `run_unit_id` in the structure) replaces every unit on each
+upload and restarts every participant's current step: make all changes in one
+upload there, and tell the user first.
 
 ## Programmatic Editing Tools
 
 For systematic changes, use the editing tools instead of manual JSON edits.
-All editing tools operate on `.formr/<name>.json` directly. Call `get_run_structure_to_file` first to ensure the file exists.
 
 ### add_run_unit
 
@@ -1743,17 +1783,18 @@ Common kwargs by unit type:
 - **Pause/Wait**: `wait_minutes`, `wait_until_time` ("HH:MM:SS"), `wait_until_date` ("YYYY-MM-DD"), `relative_to` (R expr), `body`
 - **Wait**: `body` is an integer position for click-through (NOT display content)
 - **Survey**: `study_id` (int) or `survey_data` (dict with name, items, settings)
-- **Form**: `study_id` (int) — the form_v2 renderer for an existing study. Creating the unit sets that study's `rendering_mode='v2'`. See `get_documentation("form-v2")`; the export does **not** round-trip the study link, so re-uploading a fetched structure re-sends `study_id` only if you keep it in the file yourself.
+- **Form**: `study_id` (int) — a study rendered by form_v2. The study's own `rendering_mode` decides whether the unit is a Survey or a Form; placing it changes neither. See `get_documentation("form-v2")`.
 - **Endpage/Page**: `body` (markdown/knitr content)
 - **External**: `address` (URL or R code), `api_end` (0/1)
 
 ### remove_run_unit
 
 ```
-remove_run_unit(name, position, compact=False)
+remove_run_unit(name, position, compact=False, confirm_removal=False)
 ```
 
-Remove a unit at the given position. If `compact=True`, shifts all units at higher positions down by **1** to fill the gap. Position references are automatically updated when compacting. Dangling references to the removed position are detected and reported as warnings.
+Remove a unit at the given position. formr refuses it while real participants are
+at that unit unless `confirm_removal=True`, which only the user's go-ahead justifies. If `compact=True`, shifts all units at higher positions down by **1** to fill the gap. Position references are automatically updated when compacting. Dangling references to the removed position are detected and reported as warnings.
 
 **Note**: Compact shifts by 1, not by the original spacing. This means removing position 20 from `[10, 20, 30]` produces `[10, 29]`, not `[10, 20]`. Use `renormalize_positions` afterwards to clean up to clean multiples of 10.
 
@@ -1796,18 +1837,18 @@ Safe to call on already-clean structures — if positions are already at clean m
 
 To create or modify items in a Survey unit's `survey_data`, use the JSON format
 documented in `get_documentation("survey-json")` (structure, fields, choices, page
-breaks, CSS classes) together with `get_documentation("item-types")` (all 56 item
-types, choices rules, type_options). Edit the `.formr/<name>.json` file directly
-with Read/Edit tools after fetching it with `get_run_structure_to_file`.
+breaks, CSS classes) together with `get_documentation("item-types")` (all 62 item
+types, choices rules, type_options). Edit the unit's `survey_data` in the fetched
+structure (the JSON text, or `.formr/<name>.json` locally) and upload it.
 
 ## Read-Only Inspection Tools
 
-These tools read from the local `.formr/<name>.json` file (call `get_run_structure_to_file` first):
+These tools read the run from formr on a hosted server, and from `.formr/<name>.json` locally (call `get_run_structure_to_file` first):
 
 - **`summarize_run(name, detail)`** — human-readable overview. `detail="units"` for unit-level only, `detail="items"` (default) to include all survey items. Strips HTML from labels.
 - **`find_run_items(name, query?, item_type?)`** — search items by name/label substring and/or item type (e.g. `"mc"`, `"text"`, `"calculate"`).
-- **`analyze_run(name)`** — check for structural errors: R syntax validation, variable references, branch flow, Page/Endpage blocking, Wait body validation, item consistency, and common mistakes.
-- **`open_flowchart(name)`** — upload the local run structure to the formr Flowchart Generator and open an interactive flowchart in the browser. Returns a shareable URL (expires after 24 hours). Use this to show the user a quick, intuitive overview of what was built — position flow, branches, and unit types at a glance.
+- **`analyze_run(name)`** — check for structural errors: R syntax validation (where R is installed: not on a hosted server), variable references, branch flow, Page/Endpage blocking, Wait body validation, item consistency, and common mistakes.
+- **`open_flowchart(name)`** (local only) — upload the local run structure to the formr Flowchart Generator and open an interactive flowchart in the browser. Returns a shareable URL (expires after 24 hours). Use this to show the user a quick, intuitive overview of what was built — position flow, branches, and unit types at a glance.
 
 ## Position Management
 
@@ -2513,7 +2554,7 @@ pattern gives you the *approach*; you build the units adapted to the run with th
 2. `get_pattern("<name>")` to read the structure, the R idioms, and the gotchas.
 3. Build the units yourself (add_run_unit / Edit), reusing the `key_r` snippets and renaming to
    the run's real survey/item names.
-4. `analyze_run` then `update_run_structure_from_file`.
+4. `analyze_run`, then `update_run_structure` (or `update_run_structure_from_file` locally).
 
 ## Available patterns
 
@@ -2643,24 +2684,17 @@ same `survey_items` / results tables, same run flow.
 
 ## The `Form` unit
 
-`Form` is a real run unit type (PHP `RunUnit\Form extends RunUnit\Survey`), and
-it identifies its study **differently from `Survey`**:
-
-- A `Survey` unit *shares its primary key* with the `survey_studies` row —
-  `survey_run_units.unit_id` is the study id.
-- A `Form` unit keeps **its own** `survey_units` row (`type='Form'`) and points
-  at the study through **`survey_units.form_study_id`**.
-  `survey_run_units.unit_id` stays pointed at the Form's own row.
-
-Creating a Form unit with a `study_id` also stamps `rendering_mode='v2'` on that
-study.
+A `Form` unit is a Survey unit whose study renders on v2 (`rendering_mode='v2'`). Like a
+`Survey`, it shares its study's primary key: `survey_run_units.unit_id` is the study id.
+The study's own unit row says which it is (`Form` while the study is on v2, `Survey`
+otherwise), so placing a study changes neither its engine nor its items.
 
 ### Creating one
 
-`add_run_unit(name, "Form", position, unit_fields={"study_id": <id>})`, then
-`update_run_structure_from_file`. The API accepts it — `Form` is in the PHP
-`RunUnit::SupportedUnits` list, and the structure-import path passes `study_id`
-straight through to `Form::create`.
+- `add_run_unit(name, "Form", position, unit_fields={"study_id": <id>})` places a study you
+  have. It shows as a Form if that study is on v2, else as a Survey.
+- With `survey_data` (name, items, settings) instead, formr creates the survey, on v2
+  unless its settings say otherwise.
 
 ```json
 {
@@ -2671,26 +2705,12 @@ straight through to `Form::create`.
 }
 ```
 
-Inline `survey_data` is **not** a reliable way to create a Form: the study it
-creates goes through the plain `Survey` path and comes back `rendering_mode='v1'`,
-leaving you a v2 unit pointing at a v1 study. Create/upload the survey first
-(admin UI or `/admin/survey`), then reference it by `study_id`.
+## Uploads round-trip a Form
 
-## ⚠️ The export does not round-trip a Form's study link
-
-`get_run_structure_to_file` returns a Form unit as **only**
-`{type, description, position, special}` — no `study_id`, no `survey_data`.
-(`Run::export` attaches `survey_data` only when `type === 'Survey'`, and
-`study_id` is not in the unit's export attributes.)
-
-`update_run_structure_from_file` **replaces every unit in the run**. So a plain
-fetch → edit-something-else → upload silently rebuilds the Form unit with no
-study attached, and participants hit an empty unit.
-
-**Rule: after fetching a structure that contains a `Form` unit, re-add its
-`"study_id"` in the local `.formr/<run>.json` before uploading.** Note the study
-ids somewhere first — the export won't remind you. Same caution applies to
-`duplicate_run_units` on a Form.
+A fetched structure carries each Form's `survey_data` and, from formr v2.0.0-rc13, its
+`run_unit_id`. Send both back unchanged and the unit stays as it is, with its participants:
+formr imports a survey's items only where they differ from the survey's own. A unit sent
+with its `run_unit_id` but another `study_id` or survey is a new unit.
 
 ## Per-study v2 settings
 
@@ -2708,8 +2728,9 @@ These live on the study (`survey_studies`), not on the unit:
 `survey_data.settings`, but formr's import allowlist
 (`SurveyStudy::createFromData`) does not include them — uploading a changed
 value is silently ignored. Change them in the admin UI
-(`/admin/survey/<name>` → "Form_v2 settings"), or by creating a `Form` unit
-(which sets `rendering_mode='v2'`).
+(`/admin/survey/<name>` → "Form_v2 settings"); a new survey sent as a `Form`
+unit's `survey_data` is created on v2. Placing an existing study as a `Form`
+changes nothing.
 
 `language` only translates the engine's own chrome (nav buttons, save pill,
 offline banners, validation fallbacks). Item labels and choices are whatever the
@@ -2857,9 +2878,10 @@ default) is new alongside form_v2 but renders in **both** engines. See
 3. Decide `offline_mode`, `allow_previous`, `layout`, `language`.
 4. If the study uses `add_to_home_screen` / `push_notification`, configure the
    run as an installable PWA and check `/{run}/manifest` responds.
-5. Swap the `Survey` unit for a `Form` unit pointing at the study (this sets
-   `rendering_mode='v2'`), then walk every page via the run's "use as yourself"
-   link.
+5. Switch the study to v2 in formr (`/admin/survey/<name>` → "Form_v2 settings",
+   rendering mode v2): its unit then shows as a `Form` by itself (placing it as a
+   `Form` unit does not switch it). Then walk every page via the run's "use as
+   yourself" link.
 
 ## Known limitations vs. v1
 

@@ -32,13 +32,33 @@ class TestSurveyDataSettings:
             unit["survey_data"]["settings"] = settings
         return unit
 
-    def test_use_paging_nonzero_rejected(self):
+    def test_a_survey_that_pages_stays_editable(self):
+        # formr exports use_paging (0/1); a run with such a survey must pass,
+        # and so must a copy of its unit
         items = [{"type": "note", "name": "n1", "label": "Hi", "optional": 1}]
-        unit = self._make_survey_unit("demo", items, {"use_paging": 1})
-        errors = validate_structure({"units": [unit]})
-        paging_errors = [e for e in errors if "use_paging" in e]
-        assert len(paging_errors) == 1
-        assert "must be 0 or omitted" in paging_errors[0]
+        for value in (1, "1"):
+            unit = self._make_survey_unit("demo", items, {"use_paging": value})
+            unit["run_unit_id"] = 7
+            copy = {k: v for k, v in unit.items() if k != "run_unit_id"}
+            copy["position"] = 20
+            assert validate_structure({"units": [unit, copy]}) == []
+
+    def test_a_new_survey_gets_no_custom_paging(self):
+        # formr applies a survey's settings only when it makes it, and can't
+        # turn Custom Paging off again
+        items = [{"type": "note", "name": "n1", "label": "Hi", "optional": 1}]
+        for value in (1, "1", True):
+            unit = self._make_survey_unit("demo", items, {"use_paging": value})
+            errors = validate_structure({"units": [unit]})
+            assert len(errors) == 1 and "use_paging" in errors[0] and "submit" in errors[0], errors
+        for value in (0, "0", None):
+            assert validate_structure({"units": [self._make_survey_unit("demo", items, {"use_paging": value})]}) == []
+
+    def test_v2_recording_items_are_known(self):
+        items = [{"type": t, "name": f"i{n}", "label": "x", "optional": 1}
+                 for n, t in enumerate(("data_quality", "agent_probe", "turnstile"))]
+        errors = validate_structure({"units": [self._make_survey_unit("demo", items)]})
+        assert not [e for e in errors if "unknown item type" in e], errors
 
     def test_use_paging_zero_accepted(self):
         items = [{"type": "note", "name": "n1", "label": "Hi", "optional": 1}]
@@ -62,11 +82,6 @@ class TestSurveyDataSettings:
         assert len(pi_errors) == 1
         assert "not supported" in pi_errors[0]
 
-    def test_both_forbidden_settings_rejected(self):
-        items = [{"type": "note", "name": "n1", "label": "Hi", "optional": 1}]
-        unit = self._make_survey_unit("demo", items, {"use_paging": 1, "page_items": ["n1"]})
-        errors = validate_structure({"units": [unit]})
-        assert len(errors) >= 2
 
     def test_valid_settings_accepted(self):
         items = [{"type": "note", "name": "n1", "label": "Hi", "optional": 1}]
@@ -79,12 +94,6 @@ class TestSurveyDataSettings:
         forbidden_errors = [e for e in errors if "use_paging" in e or "page_items" in e]
         assert len(forbidden_errors) == 0
 
-    def test_use_paging_string_value_rejected(self):
-        items = [{"type": "note", "name": "n1", "label": "Hi", "optional": 1}]
-        unit = self._make_survey_unit("demo", items, {"use_paging": "1"})
-        errors = validate_structure({"units": [unit]})
-        paging_errors = [e for e in errors if "use_paging" in e]
-        assert len(paging_errors) == 1
 
 class TestImportableTypes:
     """formr's importer only creates RunUnitFactory::SupportedUnits; anything
@@ -205,3 +214,44 @@ class TestFormUnit:
             ]},
         }]})
         assert any("Form unit at position 10" in e for e in errors)
+
+
+class TestWaitTarget:
+    """A Wait's body is the position a participant who comes back early is
+    sent to: one no unit has is an error page for them (formr's RunSession::runTo)."""
+
+    def _structure(self, body):
+        return {"units": [
+            {"type": "Form", "position": 10, "description": "diary", "study_id": 291},
+            {"type": "Wait", "position": 20, "body": body, "wait_minutes": 60},
+            {"type": "Endpage", "position": 30, "body": "done"},
+        ]}
+
+    @pytest.mark.parametrize("body", [30, "30", "", None])
+    def test_a_wait_sending_to_a_unit_or_nowhere_is_accepted(self, body):
+        assert validate_structure(self._structure(body)) == []
+
+    @pytest.mark.parametrize("body", [40, "40"])
+    def test_a_wait_sending_to_no_unit_is_refused(self, body):
+        errors = validate_structure(self._structure(body))
+        assert len(errors) == 1 and "Wait unit at position 20" in errors[0]
+
+
+class TestRunUnitId:
+    def test_kept_units_carry_their_run_unit_id(self):
+        assert validate_structure({"units": [
+            {"type": "Pause", "position": 10, "run_unit_id": 100},
+            {"type": "Endpage", "position": 20, "body": "Bye"},
+        ]}) == []
+
+    def test_it_must_be_a_positive_integer(self):
+        for bad in ("100", 0, -3, True, 1.5):
+            errors = validate_structure({"units": [{"type": "Pause", "position": 10, "run_unit_id": bad}]})
+            assert any("'run_unit_id' must be the integer" in e for e in errors), bad
+
+    def test_two_units_cannot_share_one(self):
+        errors = validate_structure({"units": [
+            {"type": "Pause", "position": 10, "run_unit_id": 100},
+            {"type": "Pause", "position": 20, "run_unit_id": 100},
+        ]})
+        assert any("run_unit_id 100 is also the unit's at index 0" in e for e in errors)

@@ -202,6 +202,24 @@ class TestUpdateRunStructureFromFile:
         assert "successfully updated" in result
         assert not bak.exists()
 
+    def test_the_file_takes_the_ids_formr_gave_new_units(self, tmp_path, monkeypatch):
+        # uploaded again without them, the units made last time would be new again
+        monkeypatch.setattr("formr_mcp.utils.WORKSPACE_DIR", tmp_path / "ws")
+        filepath = server_mod.run_filepath("demo")
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        filepath.write_text(json.dumps({"units": [{"type": "Pause", "position": 10, "wait_minutes": 5}]}))
+        stored = {"units": [{"type": "Pause", "position": 10, "wait_minutes": 5, "run_unit_id": 41}]}
+        mock_client = AsyncMock()
+        mock_client.put_run_structure.return_value = {"units_imported": 1, "kept": 0, "moved": 0, "created": 1,
+                                                      "removed": 0, "participants_moved": 0, "steps_ended": 0}
+        mock_client.get_run_structure.return_value = stored
+        monkeypatch.setattr(server_mod, "_client", lambda ctx: mock_client)
+
+        result = asyncio.run(server_mod.update_run_structure_from_file("demo", ctx=MagicMock()))
+        assert "created 1" in result
+        assert json.loads(filepath.read_text())["units"][0]["run_unit_id"] == 41
+        assert mock_client.put_run_structure.await_args.kwargs == {"confirm_removal": False}
+
     def test_validation_error_preserves_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr("formr_mcp.utils.WORKSPACE_DIR", tmp_path / "ws")
 
@@ -282,3 +300,17 @@ class TestVerifyUpload:
         stored = {"units": [{"type": "Survey", "position": 10}, {"type": "Pause", "position": 20}]}
         with pytest.raises(ValueError, match=r"Missing \(position, type\): \[\(20, 'SkipForward'\)\]"):
             server_mod._verify_upload("r", sent, stored)
+
+
+class TestStoredUnitTypes:
+    def test_a_study_placed_as_form_may_be_stored_as_survey(self):
+        # formr names a study's unit by the study's engine: a Form unit for a v1 study is a Survey
+        sent = {"units": [{"type": "Form", "position": 15, "study_id": 30}, {"type": "Page", "position": 20}]}
+        stored = {"units": [{"type": "Survey", "position": 15}, {"type": "Endpage", "position": 20}]}
+        server_mod._verify_upload("demo", sent, stored)
+
+    def test_survey_names_take_underscores(self):
+        from formr_mcp.utils import validate_survey_name
+        validate_survey_name("daily_diary")
+        with pytest.raises(ValueError):
+            validate_survey_name("daily-diary")

@@ -1,20 +1,19 @@
-# formr-mcp — streamable-HTTP deployment with bearer-token auth.
+# formr-mcp — the hosted (streamable-HTTP) server for a formr instance.
 #
-# Serves the MCP over HTTP at /mcp (http_server.py) so agents can reach it
-# remotely. Every request except /healthz must carry
-#   Authorization: Bearer <MCP_BEARER_TOKEN>
+# formr signs researchers in: a client that adds https://<formr host>/mcp gets a
+# 401 pointing at /.well-known/oauth-protected-resource/mcp, which names formr
+# as the authorization server; the researcher signs in on formr and chooses
+# the connection's scopes and runs. Every request then carries that
+# connection's token, which this server checks with formr and passes on.
+# No secret, credential or file is kept here.
+#
+# formr needs the same URL as FORMR_MCP_URL (settings mcp_url), and a formr
+# release that is an OAuth server (v2.0.0-rc13 and later). formr-docker runs
+# this as its docker-compose-mcp.yml layer; this file is for other setups.
 #
 # Usage:
 #   cp docker-compose.yml.example docker-compose.yml
-#   cp .env.example .env      # then fill in FORMR_* creds (see README)
-#   # add two more lines to .env:
-#   #   MCP_BEARER_TOKEN=$(openssl rand -hex 32)
-#   #   MCP_DOMAIN=mcp.example.com         # the public host /mcp is served on
-#   docker compose up -d --build
-#
-# The .env file holds BOTH the build-time nothing and the runtime secrets
-# (FORMR_BASE_URL, FORMR_CLIENT_ID, FORMR_CLIENT_SECRET, MCP_BEARER_TOKEN). It
-# is bind-mounted read-only into the container and is NOT baked into the image.
+#   FORMR_HOST=formr.example.org docker compose up -d --build
 
 services:
   formr-mcp:
@@ -24,53 +23,35 @@ services:
     image: formr-mcp:local
     container_name: formr-mcp
     restart: always
-    # Secrets stay out of the image — mounted at runtime where http_server.py
-    # (via server.py's load_dotenv) reads /app/.env.
-    volumes:
-      - ./.env:/app/.env:ro
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
     environment:
-      # MCP's DNS-rebinding guard rejects any Host it doesn't know with
-      # "Invalid Host header" (421). Behind a reverse proxy you MUST allowlist
-      # the public host here. If omitted, http_server.py falls back to the
-      # host parsed from FORMR_BASE_URL.
-      MCP_ALLOWED_HOST: ${MCP_DOMAIN}
+      FORMR_BASE_URL: https://${FORMR_HOST}
+      MCP_PUBLIC_URL: https://${FORMR_HOST}/mcp
+      # what real participants' data the hosted server may read: test_only or all
+      FORMR_DATA_ACCESS: test_only
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status==200 else 1)"]
       interval: 30s
       timeout: 3s
       retries: 3
-
-    # ---- Option A: standalone (put your own TLS proxy in front) -------------
-    # Bind to loopback and reverse-proxy /mcp to it from nginx/caddy/etc.
-    # ports:
-    #   - "127.0.0.1:8000:8000"
-
-    # ---- Option B: Traefik (labels below) -----------------------------------
-    # Attach to your existing Traefik network and route the public host's
-    # /mcp path to this service. Remove this block (and the networks: stanza)
-    # if you use Option A.
     networks:
       - proxy
     labels:
       traefik.enable: "true"
       traefik.docker.network: proxy
-
-      # Carve /mcp out of an existing host. Priority must beat whatever
-      # catch-all router already serves ${MCP_DOMAIN} (e.g. an app at
-      # priority 11 → use 20 here).
-      traefik.http.routers.formr-mcp.rule: Host(`${MCP_DOMAIN}`) && PathPrefix(`/mcp`)
-      traefik.http.routers.formr-mcp.priority: "20"
+      # /mcp and its resource metadata on formr's admin host, above formr's own router
+      traefik.http.routers.formr-mcp.rule: Host(`${FORMR_HOST}`) && (Path(`/mcp`) || Path(`/.well-known/oauth-protected-resource/mcp`))
+      traefik.http.routers.formr-mcp.priority: "100"
       traefik.http.routers.formr-mcp.entrypoints: websecure
       traefik.http.routers.formr-mcp.tls: "true"
       traefik.http.routers.formr-mcp.tls.certresolver: letsencrypt
-      # Do NOT put an IP-reputation WAF (e.g. CrowdSec) on this router: /mcp is
-      # a token-gated programmatic API, and captcha/302 challenges would break
-      # non-browser MCP clients. Bearer token + TLS are the gate.
+      # No IP-reputation WAF (CrowdSec) here: every claude.ai user comes from
+      # Anthropic's 160.79.104.0/21. formr's token check is the gate.
       traefik.http.routers.formr-mcp.service: formr-mcp
       traefik.http.services.formr-mcp.loadbalancer.server.port: "8000"
 
-# Required for Option B. Point this at your Traefik network (often created
-# externally); change the name to match, or drop if using Option A.
 networks:
   proxy:
     external: true

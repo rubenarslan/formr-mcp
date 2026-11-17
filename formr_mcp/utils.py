@@ -5,6 +5,8 @@ These are used across server.py, editing.py, analysis.py, and summarize.py.
 
 from __future__ import annotations
 
+import contextvars
+import copy
 import json
 import os
 import re
@@ -19,6 +21,20 @@ WORKSPACE_DIR = Path(_env_workspace) if _env_workspace else Path(".formr")
 # to 256 chars. Reserved-name checks are left to formr (being more permissive
 # here just defers to its server-side validation).
 VALID_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{2,255}$")
+
+
+# formr's SurveyStudy::NAME_PATTERN: a survey is named after its file, so
+# underscores, not hyphens, and at most 65 characters
+VALID_SURVEY_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{2,64}\Z")
+
+
+def validate_survey_name(name: str) -> None:
+    """Validate a survey name as formr does. Raises ValueError if invalid."""
+    if not isinstance(name, str) or not VALID_SURVEY_NAME.match(name):
+        raise ValueError(
+            f"Invalid survey name {name!r}. A survey's name starts with a letter and has "
+            f"only letters, digits and underscores, 3-65 characters."
+        )
 
 
 def validate_run_name(name: str) -> None:
@@ -80,11 +96,24 @@ def run_filepath(name: str) -> Path:
     return path
 
 
+# Over HTTP the server keeps no workspace: a tool that reads or edits a run's
+# structure is given it, fetched from formr with the caller's token, for the
+# one call (server._run_structure). Unset (stdio), the files are used.
+MEMORY_STRUCTURES: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "formr_memory_structures", default=None)
+
+
 def load_structure(name: str) -> dict:
-    """Load a run structure from the workspace.
+    """Load a run structure from the workspace, or the one fetched for this call.
 
     Raises FileNotFoundError if the file does not exist.
     """
+    store = MEMORY_STRUCTURES.get()
+    if store is not None:
+        validate_run_name(name)
+        if name not in store:
+            raise FileNotFoundError(f"Run '{name}' was not fetched for this call.")
+        return copy.deepcopy(store[name])
     filepath = safe_run_filepath(name)
     if not filepath.exists():
         raise FileNotFoundError(
@@ -99,7 +128,14 @@ def save_structure(name: str, structure: dict) -> str:
     """Save a run structure to the workspace, creating a backup first.
 
     Returns a summary string like 'Saved 5 units to .formr/name.json'.
+    For a structure fetched for this call (MEMORY_STRUCTURES), it is kept
+    there for the tool to upload if it changed (server._run_structure).
     """
+    store = MEMORY_STRUCTURES.get()
+    if store is not None:
+        validate_run_name(name)
+        store[name] = structure
+        return f"The run's structure now has {len(structure.get('units', []))} units."
     path = safe_run_filepath(name)
     bak_path = path.with_suffix(".json.bak")
     if path.exists():

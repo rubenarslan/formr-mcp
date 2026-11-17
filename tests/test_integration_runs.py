@@ -1,7 +1,8 @@
 """Live integration tests: create a run, exercise tools against it, delete it.
 
 These hit the formr instance configured in .env (FORMR_BASE_URL / CLIENT_ID /
-CLIENT_SECRET) and require run:write. They are skipped automatically when no
+CLIENT_SECRET) and require run:write and run:delete (formr v2.0.0-rc13 on; a
+credential without it leaves its mcptest-* runs behind). They are skipped automatically when no
 credentials are present, so the offline unit suite is unaffected.
 
 Every run created here is named `mcptest-<uuid>` and is torn down in a finally

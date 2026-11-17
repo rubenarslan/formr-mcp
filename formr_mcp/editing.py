@@ -140,6 +140,34 @@ def _build_unit(unit_type: str, position: int, **kwargs) -> dict:
     return unit
 
 
+def _unit_kind(unit_type: str | None) -> str | None:
+    """formr's "same kind of unit" for a placement it keeps (Run::isSamePlacedUnit):
+    a Page and an Endpage are one, so are a Survey and a Form (the study decides)."""
+    return {"Endpage": "Page", "Form": "Survey"}.get(unit_type, unit_type)
+
+
+# What a new unit of each type has in the fields formr exports for it, which
+# a structure upload leaves as they are on a unit formr keeps (Run::saveKeptUnit):
+# an overwrite that keeps the unit sends these for the fields it isn't given.
+# Not None throughout: formr refuses NULL for some (a PushMessage's priority, an
+# Email's cron_only). A survey or form keeps its study and takes only the description.
+_NEW_UNIT_FIELDS: dict[str, dict[str, Any]] = {
+    "Pause": {"body": "", "wait_until_time": None, "wait_until_date": None,
+              "wait_minutes": None, "relative_to": None},
+    "Email": {"subject": None, "account_id": None, "recipient_field": None, "body": None, "cron_only": 0},
+    "External": {"address": None, "api_end": 0, "expire_after": 0},
+    "Page": {"body": None, "title": None},
+    "PushMessage": {"message": "", "topic": None, "priority": "normal", "time_to_live": 86400,
+                    "badge_count": 1, "vibrate": 1, "require_interaction": 0, "renotify": 0, "silent": 0},
+    "SkipForward": {"automatically_jump": 1, "automatically_go_on": 1},
+    "SkipBackward": {"automatically_jump": 1, "automatically_go_on": 1},
+    "Shuffle": {"groups": 2},
+    "Privacy": {"privacy_label": "", "tos_label": ""},
+}
+_NEW_UNIT_FIELDS["Wait"] = _NEW_UNIT_FIELDS["Pause"]
+_NEW_UNIT_FIELDS["Endpage"] = _NEW_UNIT_FIELDS["Page"]
+
+
 # ── Public API ────────────────────────────────────────────────────────
 
 def add_run_unit(name: str, unit_type: str, position: int, **kwargs) -> str:
@@ -164,7 +192,18 @@ def add_run_unit(name: str, unit_type: str, position: int, **kwargs) -> str:
     shifted = False
     if position in existing_positions:
         if insert_mode == "overwrite":
+            replaced = [u for u in units if u.get("position") == position]
             units = [u for u in units if u.get("position") != position]
+            # the same kind of unit, changed: formr saves it in place, and
+            # whoever is at it stays (another kind is a new unit; for a
+            # survey formr also asks that it is the same study)
+            if replaced and "run_unit_id" in replaced[0] and _unit_kind(replaced[0].get("type")) == _unit_kind(unit_type):
+                unit["run_unit_id"] = replaced[0]["run_unit_id"]
+                # formr keeps what an upload leaves out of a unit it keeps:
+                # the fields not given get a new unit's values, so that the
+                # overwrite replaces the unit, not just the fields given
+                for field, value in _NEW_UNIT_FIELDS.get(unit_type, {}).items():
+                    unit.setdefault(field, value)
         elif insert_mode == "shift":
             position_map = {}
             for u in units:
@@ -281,7 +320,6 @@ def duplicate_run_units(name: str, from_positions: list[int], to_start_position:
         new_positions.append(to_start_position + (i * 10))
 
     # Build mapping from source positions to new positions (for internal remap)
-    source_set = set(from_positions)
     source_to_dest: dict[int, int] = {}
     for src_pos, new_pos in zip(sorted(from_positions), new_positions):
         source_to_dest[src_pos] = new_pos
@@ -297,7 +335,9 @@ def duplicate_run_units(name: str, from_positions: list[int], to_start_position:
             shift_by = max(new_positions) - min(conflicts) + 10
             for u in units:
                 p = u.get("position")
-                if isinstance(p, int) and p >= min(conflicts) and p not in source_set:
+                # the originals too: copied ahead of themselves, they keep
+                # their order behind the copies
+                if isinstance(p, int) and p >= min(conflicts):
                     shift_map[p] = p + shift_by
                     u["position"] = p + shift_by
     else:
@@ -315,6 +355,8 @@ def duplicate_run_units(name: str, from_positions: list[int], to_start_position:
     for src, new_pos in zip(source_units, new_positions):
         new_unit = copy.deepcopy(src)
         new_unit["position"] = new_pos
+        # a copy is a new unit: formr would take it for the original
+        new_unit.pop("run_unit_id", None)
         # Add "copy" prefix to description to distinguish from originals
         # But don't stack "copy:" prefixes on re-duplication
         if "description" in new_unit and new_unit["description"]:

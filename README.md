@@ -1,253 +1,238 @@
 # formr-mcp
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server for the [formr](https://formr.org) survey framework. Let LLM agents inspect, create, and edit formr run structures, manage settings, and get design guidance — all through natural language.
+A [Model Context Protocol](https://modelcontextprotocol.io) server for the
+[formr](https://formr.org) survey framework. It lets an AI assistant (Claude,
+ChatGPT, Codex, Copilot in VS Code, Cursor, Gemini CLI and other MCP apps)
+inspect, build and change formr runs and surveys, make and walk test sessions,
+and look up formr's documentation, in conversation.
 
-## Prerequisites
+It runs in one of two ways:
 
-- **Python 3.12+**
-- **[uv](https://docs.astral.sh/uv/)** — fast Python package manager
-- **formr instance** with admin (≥ 2) API access — create credentials at `<base_url>/admin/account#api`
-- **R** (optional) — enables R syntax validation in `analyze_run`
+| | Hosted | Local |
+| --- | --- | --- |
+| Who runs it | the formr instance, for all its researchers | you, on your computer |
+| How you connect | add the instance's address to your app, sign in on formr | your app starts it; an API credential in `.env` |
+| Apps | Claude, Claude Code, ChatGPT, Codex, VS Code | any MCP app that starts local servers |
+| Needs | formr v2.0.0-rc13 or later, set up by its operators | Python 3.12+, [uv](https://docs.astral.sh/uv/), an API credential (admin level 2) |
+| Extra tools | — | a run's structure as a file to edit; flowcharts |
 
-## Quick Start
+## Hosted: add formr to your app by its address
+
+Where the instance runs it, its address is `https://<formr admin host>/mcp`
+(formr's Documentation → AI assistants shows it).
+
+| App | How |
+| --- | --- |
+| Claude (web, desktop, mobile) | Settings → Connectors → Add custom connector, paste the address |
+| Claude Code | `claude mcp add --transport http formr https://<host>/mcp`, then `/mcp` to sign in |
+| ChatGPT (web) | add a custom MCP server with the address (under Plugins, or Settings → Apps with developer mode on, depending on the plan); authentication OAuth, registration by client metadata document (CIMD) if asked |
+| Codex (CLI, IDE, app) | `codex mcp add formr --url https://<host>/mcp`, then `codex mcp login formr` |
+| VS Code (GitHub Copilot) | Command Palette → *MCP: Add Server* → HTTP, or `.vscode/mcp.json`: `{"servers": {"formr": {"type": "http", "url": "https://<host>/mcp"}}}`; the tools are in agent mode |
+
+The app sends you to formr to sign in (login, 2FA, admin level 2), where you
+choose the connection's scopes and runs, as for an API credential. formr is the
+OAuth server: it knows each app by its client ID metadata document (on
+`claude.ai`, `chatgpt.com` or `vscode.dev`; formr's `oauth_client_metadata_hosts`),
+requires PKCE, and lists each connection under Account → API, where you narrow
+or delete it (deleting ends it at once).
+
+Apps that register themselves with every server instead (dynamic client
+registration: Cursor and Gemini CLI, in November 2026) can't sign in this way;
+use the [local server](#local-run-it-on-your-computer).
+
+Every request carries the connection's token; the server checks it with formr
+(`GET /api/v1/user/token`) and calls the API with it, so formr's scopes, run
+allowlist and run ownership decide every call. The server keeps no credential,
+secret or file: the editing tools fetch the run from formr, edit, validate and
+upload it in one step, and `get_run_structure_to_file`,
+`update_run_structure_from_file` and `open_flowchart` are not offered.
+
+### Running the hosted server (operators)
+
+- **formr-docker**: append `:docker-compose-mcp.yml` to `COMPOSE_FILE`, then
+  `./update.sh`. The layer runs `http_server.py` from the `formr-mcp` image, sets
+  formr's `mcp_url` and routes `/mcp` and formr's OAuth endpoints on the admin host.
+- **Elsewhere**: `uv run http_server.py` (or the `Dockerfile`), behind HTTPS, with:
+
+| Variable | |
+| --- | --- |
+| `FORMR_BASE_URL` | formr's admin origin, the issuer (e.g. `https://formr.example.org`) |
+| `MCP_PUBLIC_URL` | this server's address, formr's `mcp_url` (e.g. `https://formr.example.org/mcp`); it answers only requests for this host |
+| `FORMR_DATA_ACCESS` | the ceiling for every researcher: `test_only` (default) or `all` ([Participants' data](#participants-data)) |
+| `MCP_HTTP_HOST`, `MCP_HTTP_PORT` | where it listens (`0.0.0.0`, `8000`) |
+| `MCP_FORWARDED_ALLOW_IPS` | proxies whose `X-Forwarded-*` headers it takes (`*`) |
+| `FORMR_HTTP_TIMEOUT`, `FORMR_MCP_LOG_LEVEL` | as for the local server |
+
+Route `/mcp` to it, and `/.well-known/oauth-authorization-server` and
+`/api/oauth/` on the admin host to formr, and set `$settings['mcp_url']`. Claude's
+and ChatGPT's requests come from their companies' shared addresses, for all
+their users at once: don't IP-ban them, and rate-limit per address generously.
+formr's INSTALLATION.md ("AI assistants") has the details.
+
+## Local: run it on your computer
+
+Works with any formr instance and any MCP app that starts local servers.
+
+1. Make an API credential under Account → API in formr (needs admin level 2).
+   Give it the scopes and runs it needs: `run:read`, `run:write`, `survey:read`,
+   `survey:write` to design runs; `session:read`, `session:write`, `data:read`
+   for test sessions; `file:read`, `file:write` for run files; `run:delete` only
+   to delete runs. Its secret is a password: keep it out of shared folders.
+2. Install:
+
+   ```bash
+   git clone https://github.com/rubenarslan/formr-mcp && cd formr-mcp
+   cp .env.example .env    # then fill in FORMR_BASE_URL, FORMR_CLIENT_ID, FORMR_CLIENT_SECRET
+   uv sync
+   ```
+
+3. Add it to your app (below). The server reads `.env` next to `server.py`.
+
+| Variable | |
+| --- | --- |
+| `FORMR_BASE_URL` | the formr instance (e.g. `https://formr.example.org`) |
+| `FORMR_CLIENT_ID` | the credential's 32-character client ID |
+| `FORMR_CLIENT_SECRET` | its 64-character secret |
+| `FORMR_DATA_ACCESS` | (optional) `test_only` (default) or `all` ([Participants' data](#participants-data)) |
+| `FORMR_WORKSPACE_DIR` | (optional) where run files are kept (default `.formr/` in the app's working directory) |
+| `FORMR_HTTP_TIMEOUT` | (optional) seconds per request to formr (default `60`) |
+| `FORMR_MCP_LOG_LEVEL` | (optional) `INFO` (default) or `DEBUG` |
+| `FLOWCHART_URL` | (optional) the formr Flowchart Generator `open_flowchart` uploads to |
+
+Replace `/path/to/formr-mcp` below with where you cloned it.
+
+**Claude Desktop**: `claude_desktop_config.json` (macOS `~/Library/Application Support/Claude/`,
+Windows `%APPDATA%\Claude\`):
+
+```json
+{"mcpServers": {"formr": {"command": "uv", "args": ["run", "--directory", "/path/to/formr-mcp", "server.py"]}}}
+```
+
+**Claude Code**:
 
 ```bash
-git clone https://github.com/timseidel/formr-mcp && cd formr-mcp
-cp .env.example .env
-# Edit .env with your formr instance URL and API credentials
-uv sync
-uv run server.py
+claude mcp add formr -- uv run --directory /path/to/formr-mcp server.py
 ```
 
-### Environment Variables
+**Codex** (`~/.codex/config.toml`):
 
-| Variable | Description |
-|---|---|
-| `FORMR_BASE_URL` | formr instance URL (e.g. `http://localhost`) |
-| `FORMR_CLIENT_ID` | 32-char hex client ID from `/admin/account#api` |
-| `FORMR_CLIENT_SECRET` | 64-char hex secret from `/admin/account#api` |
-| `FORMR_DATA_ACCESS` | (optional) participant-data ceiling: `test_only` (default) or `all` |
-| `FORMR_HTTP_TIMEOUT` | (optional) HTTP timeout in seconds (default `60`) |
-| `FORMR_MCP_LOG_LEVEL` | (optional) log verbosity (default `INFO`; use `DEBUG` for raw httpx lines) |
-| `FLOWCHART_URL` | (optional) URL of the formr Flowchart Generator (default: `https://formr-flowchart-test.pages.dev`) |
+```toml
+[mcp_servers.formr]
+command = "uv"
+args = ["run", "--directory", "/path/to/formr-mcp", "server.py"]
+```
 
-## MCP Client Configuration
-
-### opencode
-
-Add to `opencode.json` in your project root:
+**VS Code** (`.vscode/mcp.json`):
 
 ```json
-{
-  "mcp": {
-    "formr-mcp": {
-      "type": "local",
-      "command": ["uv", "run", "server.py"],
-      "enabled": true
-    }
-  }
-}
+{"servers": {"formr": {"type": "stdio", "command": "uv", "args": ["run", "--directory", "/path/to/formr-mcp", "server.py"]}}}
 ```
 
-Or copy from the included example:
-
-```bash
-cp opencode.json.example opencode.json
-```
-
-### Claude Desktop
-
-Add to `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`, Windows: `%APPDATA%\Claude\`):
+**Cursor** (`.cursor/mcp.json`) and **Gemini CLI** (`~/.gemini/settings.json`):
 
 ```json
-{
-  "mcpServers": {
-    "formr-mcp": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/formr-mcp", "server.py"],
-      "env": {
-        "FORMR_BASE_URL": "http://localhost",
-        "FORMR_CLIENT_ID": "your_client_id",
-        "FORMR_CLIENT_SECRET": "your_client_secret"
-      }
-    }
-  }
-}
+{"mcpServers": {"formr": {"command": "uv", "args": ["run", "--directory", "/path/to/formr-mcp", "server.py"]}}}
 ```
 
-### Cursor
-
-Add to `.cursor/mcp.json` in your project:
+**opencode** (`opencode.json` in your project; `opencode.json.example` has it):
 
 ```json
-{
-  "mcpServers": {
-    "formr-mcp": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/formr-mcp", "server.py"]
-    }
-  }
-}
+{"mcp": {"formr": {"type": "local", "command": ["uv", "run", "--directory", "/path/to/formr-mcp", "server.py"], "enabled": true}}}
 ```
 
-Set `FORMR_BASE_URL`, `FORMR_CLIENT_ID`, and `FORMR_CLIENT_SECRET` in a `.env` file in the project root.
+ChatGPT on the web reaches only servers on the internet: use the hosted server.
 
-## Available Tools
+## Participants' data
 
-### Run Management
+The read tools (sessions, results, logs, files) pass on what `FORMR_DATA_ACCESS`
+allows, whatever the credential's or connection's scopes: `test_only`, the
+default, only test sessions (`testing=1`); `all`, real participants' too. Per-call
+filters apply within that ceiling and never exceed it; `whoami` reports it. On a
+hosted server the operator sets it for everyone. What the tools return goes to the
+AI company that runs the assistant. Run secrets reach it by name only.
 
-| Tool | Description |
-|---|---|
-| `list_runs` | List all runs, optionally filter by name |
-| `get_run` | Get run metadata by exact name |
-| `create_run` | Create a new empty run |
-| `delete_run` | Permanently delete a run and all its data |
-| `whoami` | Identify the user **and report this token's capabilities** — granted scopes, read-only/run-allowlist limits, data-access mode, and a per-tool availability map. Call this first. |
+## Changing a live run
 
-### Reading Data
+Uploads change only what changed (formr v2.0.0-rc13 and later):
 
-| Tool | Description |
-|---|---|
-| `list_sessions` | List participant sessions (code, position, ended, testing flag) |
-| `get_session` | Get one session by its code |
-| `list_unit_sessions` | Per-unit history for progress / dropout / trajectory analysis |
-| `get_run_results` | Raw survey responses, keyed by survey (filter by survey/session/item) |
-| `list_run_files` | List uploaded-file metadata |
-| `get_survey_structure` | Survey item definitions and choice lists (not participant data) |
+- `get_run_structure` gives each unit its `run_unit_id`. A unit sent back with it
+  stays that unit: its participants stay on it, and move with it when its
+  position changes. A unit without one is new; the editing tools take care of
+  this (`duplicate_run_units` drops it from copies).
+- The structure's `version` makes formr refuse an upload made from a copy that
+  changed in formr meanwhile (fetch again).
+- A unit left out is removed, and its participants go on from whatever now stands
+  in its place. Where real participants are at it, formr refuses the upload until
+  it is repeated with `confirm_removal=true` (`remove_run_unit`,
+  `update_run_structure`, `update_run_structure_from_file`): the assistant is told
+  to ask you first.
+- Survey items are saved only where they differ, and that needs `survey:write`.
 
-> **Data-access gate (GDPR).** `FORMR_DATA_ACCESS` sets a hard ceiling on what the read
-> tools may return: `test_only` (the default) exposes only test sessions (`testing=1`);
-> `all` exposes real participant data. Per-call test/real filters apply within the ceiling
-> but can never exceed it. See `.env.example` and the `data-access` documentation topic.
+An older formr replaces every unit on each upload and restarts every
+participant's current step.
 
-### Structure Editing
+## Tools
 
-| Tool | Description |
-|---|---|
-| `get_run_structure_to_file` | Fetch full structure to `.formr/<name>.json` (backs up existing) |
-| `update_run_structure_from_file` | Validate and upload from `.formr/<name>.json` |
-| `get_run_structure` | Fetch full structure as **JSON text** (no file — for clients without filesystem access, e.g. Claude Desktop) |
-| `update_run_structure` | Validate and upload a structure passed as **JSON text** |
-| `update_run_settings` | Change run-level settings (title, visibility, etc.) |
+Each tool needs the scope formr checks for its API call; `whoami` lists what
+the connection or credential may use. *Local only*: not offered by a hosted server.
 
-### Inspection & Analysis
+| Group | Tools |
+| --- | --- |
+| Account | `whoami` (scopes, run allowlist, data ceiling, which tools work; call it first) |
+| Runs | `list_runs`, `get_run`, `create_run`, `update_run_settings`, `delete_run` (`run:delete`) |
+| Structure | `get_run_structure`, `update_run_structure` (JSON text); `get_run_structure_to_file`, `update_run_structure_from_file` (*local only*: `.formr/<name>.json`) |
+| Editing | `add_run_unit`, `remove_run_unit`, `duplicate_run_units`, `shift_run_positions`, `renormalize_positions` (each remaps branch targets and Wait positions) |
+| Checking | `summarize_run`, `find_run_items`, `analyze_run` (branch flow, references, item consistency; R syntax where R is installed), `open_flowchart` (*local only*: uploads the structure to the Flowchart Generator, a link for 24 hours) |
+| Surveys | `get_survey_structure`, `fetch_google_sheet` (a sheet shared by link, as CSV text; XLSX and files *local only*) |
+| Test sessions | `create_test_sessions` (with their links), `test_session_action` (advance, execute, move to a position, end an External), `get_run_logs` (unit, email and push logs) |
+| Participants' data | `list_sessions`, `get_session`, `list_unit_sessions`, `get_run_results` (within the [data ceiling](#participants-data)) |
+| Run files | `list_run_files`, `upload_run_file` (text or base64; a workspace file *local only*), `delete_run_file` |
+| Help | `get_documentation`, `get_documentation_topics`, `get_documentation_sections`, `get_unit_types`, `list_patterns`, `get_pattern` |
 
-| Tool | Description |
-|---|---|
-| `summarize_run` | Human-readable overview (`detail="units"` or `"items"`) |
-| `find_run_items` | Search items by name/label substring and/or type |
-| `analyze_run` | Check R syntax, variable refs, branch flow, item consistency |
-| `open_flowchart` | Upload run structure and get a shareable flowchart URL (expires in 24h) |
+Documentation topics: `item-types`, `run-concepts`, `r-code`, `survey-json`,
+`examples`, `editing-tools`, `best-practices`, `unit-types-advanced`,
+`data-access`, `patterns`, `custom-r-and-secrets`, `form-v2`.
 
-### Documentation
+### Editing with files (local)
 
-| Tool | Description |
-|---|---|
-| `get_documentation` | Learn formr design (topics: `item-types`, `run-concepts`, `r-code`, `survey-json`, `examples`, `best-practices`, `form-v2`) |
-| `get_unit_types` | Get all supported unit types and their required/optional fields |
-| `get_documentation_topics` | List available documentation topics |
-
-### Utilities
-
-| Tool | Description |
-|---|---|
-| `fetch_google_sheet` | Fetch a Google Sheet by its share/edit link as **CSV** (returned as text, or `to_file=True` to write `.formr/sheets/*.csv`) or **XLSX** (written to a file). Canonicalizes the link into the export URL for you. |
-
-## Importing from Google Sheets
-
-formr surveys are often authored in Google Sheets. A client like Claude Desktop
-can't turn a sheet's share link into the CSV/XLSX export URL on its own, so use
-`fetch_google_sheet`:
+With file access (a coding agent or editor), large runs are easier as a file:
 
 ```
-# read a tab as CSV text (default) — no filesystem connector needed
-fetch_google_sheet("https://docs.google.com/spreadsheets/d/<ID>/edit#gid=0")
-
-# write the workbook as XLSX (e.g. to upload via formr's survey import)
-fetch_google_sheet("<sheet link>", format="xlsx")
+1. get_run_structure_to_file("my-run")       → .formr/my-run.json (the old one kept as .bak)
+2. edit .formr/my-run.json
+3. update_run_structure_from_file("my-run")  → validates, uploads, removes the .bak
 ```
 
-The sheet must be link-accessible (**Share → Anyone with the link → Viewer**) or
-published to the web; a private sheet returns a clear sharing error. The `gid` in
-the link selects the tab for CSV; XLSX always exports the whole workbook.
-
-## Structure Editing Workflow
-
-Run structures can be large. **With filesystem access** (Claude Code, editors), prefer the
-**file-based workflow** instead of passing JSON through tool arguments:
-
-```
-1. Fetch   get_run_structure_to_file("my-run")
-           → writes .formr/my-run.json
-
-2. Edit    Use your editor/agent to modify .formr/my-run.json
-
-3. Upload  update_run_structure_from_file("my-run")
-           → validates, uploads, removes backup on success
-```
-
-- If `.formr/my-run.json` already exists, the previous version is backed up to `.formr/my-run.json.bak`
-- On upload validation errors, fix the file and retry — restore from `.bak` if stuck
-- The `.formr/` directory is gitignored
-
-**Without filesystem access** (e.g. Claude Desktop with no filesystem connector), use the
-inline text tools instead — same validation, no files:
-
-```
-1. Fetch   get_run_structure("my-run")          → returns the structure as JSON text
-2. Edit    Modify the JSON inline
-3. Upload  update_run_structure("my-run", "<json text>")  → validates and uploads
-```
-
-## Project Structure
-
-```
-formr-mcp/
-├── server.py                  # MCP server entry point, tool definitions
-├── formr_mcp/
-│   ├── auth.py                # OAuth2 client credentials flow
-│   ├── client.py              # HTTP client for formr REST API
-│   ├── documentation.py       # Built-in design documentation topics
-│   ├── analysis.py            # Run structure analysis (R syntax, refs, flow)
-│   ├── summarize.py           # Run summarization and item search
-│   └── validation.py          # Structure validation (types, positions, choices)
-├── tests/
-│   ├── test_server.py         # Server and tool tests
-│   ├── test_analysis.py       # Analysis module tests
-│   ├── test_summarize.py       # Summarization tests
-│   └── test_normalize_choices.py # Choice normalization tests
-├── .env.example               # Environment variable template
-├── opencode.json.example      # opencode MCP config template
-└── pyproject.toml             # Project metadata and dependencies
-```
+The editing and checking tools then work on that file. Without file access, or
+on a hosted server: `get_run_structure`, edit the JSON in the reply,
+`update_run_structure`.
 
 ## Logs
 
-The server logs to **stderr** (stdout is the JSON-RPC channel and must stay
-clean). At the default `INFO` level it logs each tool call (name, arg preview,
-duration, success/error) and each formr API request (status + duration);
-`FORMR_MCP_LOG_LEVEL=DEBUG` additionally surfaces raw httpx lines.
+The server logs to **stderr** (stdout is the local server's JSON-RPC channel).
+At `INFO` it logs each tool call (name, argument preview, duration, outcome) and
+each formr API request (status, duration); `DEBUG` adds httpx's lines.
 
-Where stderr ends up depends on the client:
+- **Claude Desktop**: `~/Library/Logs/Claude/mcp-server-<name>.log` (macOS),
+  `%APPDATA%\Claude\logs\mcp-server-<name>.log` (Windows).
+- **Claude Code**: `claude --debug`; `/mcp` shows the status.
+- **Other apps**: their MCP or output panel (VS Code: the server's *Show Output*).
+- **Directly**: `npx @modelcontextprotocol/inspector uv run server.py`. The hosted
+  server answers only for `MCP_PUBLIC_URL`'s host, so to try it on your computer
+  set that to the address you call it at (`MCP_PUBLIC_URL=http://localhost:8000/mcp`);
+  signing in then needs a formr whose `mcp_url` is that address.
 
-- **Claude Desktop** captures it per server:
-  `~/Library/Logs/Claude/mcp-server-<name>.log` (macOS),
-  `%APPDATA%\Claude\logs\mcp-server-<name>.log` (Windows). `<name>` is your
-  config key. `tail -f` it.
-- **Claude Code** — run `claude --debug` to see it inline; `/mcp` shows status.
-- **See it live / debug directly** — run the server yourself with the MCP
-  Inspector: `npx @modelcontextprotocol/inspector uv run server.py`, or run the
-  HTTP entrypoint: `MCP_BEARER_TOKEN=dev MCP_LOG_LEVEL=debug uv run http_server.py`.
-
-## Testing
+## Development
 
 ```bash
 uv run --with pytest pytest tests/
 ```
 
-## Data Protection
-
-This server interacts with the formr **admin API** only. It accesses run structures, survey definitions, and settings — **never participant response data**. Runs are fetched and edited as structural JSON, not as data exports.
+`server.py` defines the tools; `http_server.py` is the hosted entry point
+(token check: `formr_mcp/auth.py`). `formr_mcp/`: `client.py` (formr's API),
+`validation.py`, `editing.py`, `analysis.py`, `summarize.py`, `data_access.py`
+(the data ceiling), `documentation.py` and `patterns.py` (the help topics),
+`google_sheets.py`, `logsetup.py`.
 
 ## License
 

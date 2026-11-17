@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import json
 import re
-from pathlib import Path
 from typing import Literal
 
-from formr_mcp.utils import safe_run_filepath, validate_run_name
+from formr_mcp.utils import load_structure, validate_run_name
 from formr_mcp.validation import SURVEY_UNIT_TYPES
 
 
@@ -40,15 +38,7 @@ def summarize_run_structure(
     name: str,
     detail: Literal["units", "items"] = "items",
 ) -> str:
-    filepath = safe_run_filepath(name)
-    if not filepath.exists():
-        raise FileNotFoundError(
-            f"No local file for run '{name}'. "
-            f"Call get_run_structure_to_file(\"{name}\") first."
-        )
-
-    with open(filepath, encoding="utf-8") as f:
-        data = json.load(f)
+    data = load_structure(name)
 
     units = data.get("units", [])
     settings = data.get("settings") or {}
@@ -180,15 +170,7 @@ def find_items(
     query: str | None = None,
     item_type: str | None = None,
 ) -> str:
-    filepath = safe_run_filepath(name)
-    if not filepath.exists():
-        raise FileNotFoundError(
-            f"No local file for run '{name}'. "
-            f"Call get_run_structure_to_file(\"{name}\") first."
-        )
-
-    with open(filepath, encoding="utf-8") as f:
-        data = json.load(f)
+    data = load_structure(name)
 
     units = data.get("units", [])
     survey_results: list[tuple] = []
