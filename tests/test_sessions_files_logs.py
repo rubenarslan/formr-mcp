@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import server as server_mod
 from formr_mcp import data_access as gate
 from formr_mcp import utils
-from formr_mcp.client import FormrClient, FormrClientError
+from formr_mcp.client import FormrAnswerLost, FormrClient, FormrClientError, FormrPermissionError
 
 
 def _with_client(monkeypatch, client):
@@ -48,6 +48,26 @@ class TestCreateTestSessions:
         assert out["created"] == [{"code": "x" * 64, "test_link": None}]
         assert out["errors"][0]["code"] == "bad"
 
+    def test_the_run_is_read_before_any_session_is_made(self, monkeypatch):
+        # a token without run:read (whoami: blocked) made sessions, then failed
+        c = _with_client(monkeypatch, AsyncMock())
+        c.get_run.side_effect = FormrPermissionError("GET api/v1/runs/demo -> 403")
+        with pytest.raises(FormrPermissionError):
+            _run(server_mod.create_test_sessions("demo", count=2, ctx=MagicMock()))
+        c.create_sessions.assert_not_awaited()
+
+    def test_a_failing_later_request_hands_over_the_codes_made_so_far(self, monkeypatch):
+        c = _with_client(monkeypatch, AsyncMock())
+        c.get_run.return_value = {"link": "https://study.example.org/demo/"}
+        c.create_sessions.side_effect = [
+            {"sessions": ["a" * 64]},
+            FormrClientError("POST api/v1/runs/demo/sessions -> 500: Failed to create random session.",
+                             status=500)]
+        out = _run(server_mod.create_test_sessions("demo", count=3, ctx=MagicMock()))
+        assert c.create_sessions.await_count == 2
+        assert [s["code"] for s in out["created"]] == ["a" * 64]
+        assert "1 of 3" in out["errors"][0]["reason"]
+
     @pytest.mark.parametrize("count", [0, 51])
     def test_count_is_bounded(self, monkeypatch, count):
         _with_client(monkeypatch, AsyncMock())
@@ -71,6 +91,26 @@ class TestSessionAction:
         out = _run(server_mod.test_session_action("demo", "t", "advance", position=99, ctx=MagicMock()))
         c.session_action.assert_awaited_once_with("demo", "t", "advance", position=None)
         assert out["session"]["position"] == 20
+
+    @pytest.mark.parametrize("err", [FormrClientError("GET ... -> 503", status=503),
+                                     FormrAnswerLost("GET ... timed out"),
+                                     httpx.ConnectError("refused")])
+    def test_a_failed_read_back_is_no_failure(self, monkeypatch, err):
+        c = _with_client(monkeypatch, AsyncMock())
+        c.get_session.side_effect = [{"testing": 1, "position": 10}, err]
+        c.session_action.return_value = {"message": "Session advanced successfully."}
+        out = _run(server_mod.test_session_action("demo", "t", "advance", ctx=MagicMock()))
+        c.session_action.assert_awaited_once()
+        assert out["session"] is None and "Do not repeat" in out["note"]
+
+    @pytest.mark.parametrize("err", [FormrAnswerLost("POST ... timed out"),
+                                     FormrClientError("POST ... -> 504", status=504)])
+    def test_a_lost_answer_says_formr_may_have_done_it(self, monkeypatch, err):
+        c = _with_client(monkeypatch, AsyncMock())
+        c.get_session.return_value = {"testing": 1, "position": 10}
+        c.session_action.side_effect = err
+        with pytest.raises(ValueError, match="may have done it"):
+            _run(server_mod.test_session_action("demo", "t", "advance", ctx=MagicMock()))
 
     def test_move_needs_a_position(self, monkeypatch):
         _with_client(monkeypatch, AsyncMock())
@@ -114,6 +154,17 @@ class TestUploadRunFile:
                                         content_base64=base64.b64encode(b"\0\1").decode(),
                                         ctx=MagicMock()))
         assert c.upload_run_file.await_args.args[2] == b"\0\1"
+
+    @pytest.mark.parametrize("err", [FormrPermissionError("GET api/v1/runs/demo/files -> 403"),
+                                     FormrAnswerLost("GET ... timed out"),
+                                     FormrClientError("GET ... -> 503", status=503)])
+    def test_a_stored_file_is_no_failure_when_the_listing_fails(self, monkeypatch, err):
+        c = self._client(monkeypatch)
+        c.get_run_files.side_effect = err
+        out = _run(server_mod.upload_run_file("demo", filename="s.css", text="body{}", ctx=MagicMock()))
+        c.upload_run_file.assert_awaited_once()
+        assert out["file"] == "logo.png" and out["entry"] is None
+        assert "list_run_files" in out["note"]
 
     def test_exactly_one_source_and_a_name(self, monkeypatch):
         self._client(monkeypatch)
@@ -168,9 +219,27 @@ class TestGetRunLogs:
 
     def test_missing_endpoint_is_explained(self, monkeypatch):
         c = _with_client(monkeypatch, AsyncMock())
-        c.get_logs.side_effect = FormrClientError("GET api/v1/runs/demo/logs/push -> 404: {}")
+        c.get_logs.side_effect = FormrClientError(
+            'GET api/v1/runs/demo/logs/push -> 404: {"error":"Run sub-resource not found"}', status=404)
         with pytest.raises(FormrClientError, match="no push log endpoint"):
             _run(server_mod.get_run_logs("demo", kind="push", ctx=MagicMock()))
+
+    def test_a_run_that_does_not_exist_is_said_so(self, monkeypatch):
+        # a formr with the endpoint: a mistyped run name is formr's own 404
+        c = _with_client(monkeypatch, AsyncMock())
+        c.get_logs.side_effect = FormrClientError('GET api/v1/runs/dmeo/logs/push -> 404: {"error":"Run not found"}', status=404)
+        with pytest.raises(FormrClientError, match="Run not found"):
+            _run(server_mod.get_run_logs("dmeo", kind="push", ctx=MagicMock()))
+
+    def test_a_full_page_says_where_the_next_one_starts(self, monkeypatch):
+        monkeypatch.delenv("FORMR_DATA_ACCESS", raising=False)
+        c = _with_client(monkeypatch, AsyncMock())
+        c.get_unit_sessions.return_value = [{"testing": True, "result_log": None}] * 3
+        out = _run(server_mod.get_run_logs("demo", limit=3, ctx=MagicMock()))
+        assert out["count"] == 0 and out["next_offset"] == 3 and "offset=3" in out["more"]
+        c.get_unit_sessions.return_value = [{"testing": True, "result_log": None}] * 2
+        out = _run(server_mod.get_run_logs("demo", limit=3, ctx=MagicMock()))
+        assert "next_offset" not in out
 
 
 class TestClientRequests:

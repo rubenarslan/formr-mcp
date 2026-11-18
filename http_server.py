@@ -25,6 +25,7 @@ import os
 from urllib.parse import urlparse
 
 import uvicorn
+from mcp.server.auth.middleware.bearer_auth import RequireAuthMiddleware
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.authentication import AuthenticationMiddleware
@@ -62,7 +63,11 @@ def build_app():
     public_url = os.environ.get("MCP_PUBLIC_URL", "").strip().rstrip("/")
     if not base_url or not public_url:
         raise SystemExit("FORMR_BASE_URL and MCP_PUBLIC_URL must be set.")
-    mcp_path = urlparse(public_url).path or "/mcp"
+    mcp_path = urlparse(public_url).path
+    if not mcp_path or mcp_path == "/":
+        # the server answers at a path of its own, and the URL researchers add
+        # (formr's mcp_url) is that path: without one they POST to / and get a 404
+        raise SystemExit("MCP_PUBLIC_URL must name the MCP's path, e.g. https://formr.example.org/mcp.")
 
     # the tools call formr at the same address the tokens are checked with
     server.BASE_URL = base_url
@@ -74,7 +79,10 @@ def build_app():
     # required_scopes stays None: the SDK enforces it on every request, and
     # each tool's scope is formr's to check (whoami lists them)
     mcp.settings.auth = AuthSettings(issuer_url=base_url, resource_server_url=public_url)
-    mcp._token_verifier = FormrTokenVerifier(base_url, server.shared_http(), resource=public_url)
+    verifier = FormrTokenVerifier(base_url, server.shared_http(), resource=public_url)
+    # FastMCP takes a verifier only in its constructor (with auth), and server.mcp
+    # is built at import for stdio too: set it where 1.27's streamable_http_app() reads it
+    mcp._token_verifier = verifier
 
     # DNS-rebinding protection defaults to localhost-only; behind a reverse
     # proxy the public Host header must be allowlisted or every request 421s.
@@ -85,10 +93,24 @@ def build_app():
         allowed_origins=[f"https://{host}", f"https://{host}:*"],
     )
     app = mcp.streamable_http_app()
-    for middleware in app.user_middleware:
-        if middleware.cls is AuthenticationMiddleware:
-            middleware.kwargs["on_error"] = _auth_error
+    for middleware in _require_token_check(app, verifier, mcp_path):
+        middleware.kwargs["on_error"] = _auth_error
     return HealthzMiddleware(app)
+
+
+def _require_token_check(app, verifier, path):
+    """The SDK's middleware that checks every token with `verifier`, and `path`
+    behind its 401: an SDK that no longer reads FastMCP._token_verifier would
+    serve /mcp to anyone; it does not start instead."""
+    auth = [m for m in app.user_middleware if m.cls is AuthenticationMiddleware
+            and getattr(m.kwargs.get("backend"), "token_verifier", None) is verifier]
+    guarded = any(getattr(r, "path", None) == path
+                  and isinstance(getattr(r, "endpoint", None), RequireAuthMiddleware)
+                  for r in app.routes)
+    if not auth or not guarded:
+        raise SystemExit("formr-mcp: this mcp SDK did not install formr's token check "
+                         "(FastMCP._token_verifier); not serving /mcp without it.")
+    return auth
 
 
 def main() -> None:

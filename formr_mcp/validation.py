@@ -276,7 +276,8 @@ def _new_surveys_with_custom_paging(units: list) -> list[str]:
     with its run_unit_id is one formr has, and keeps its settings: a round trip
     of a survey that pages, and a copy of its unit, stay editable."""
     def survey_data(unit):
-        if isinstance(unit, dict) and unit.get("type") in SURVEY_UNIT_TYPES and isinstance(unit.get("survey_data"), dict):
+        if (isinstance(unit, dict) and isinstance(unit.get("type"), str) and unit["type"] in SURVEY_UNIT_TYPES
+                and isinstance(unit.get("survey_data"), dict)):
             return unit["survey_data"]
         return None
 
@@ -397,7 +398,8 @@ def validate_structure(data: dict) -> list[str]:
             continue
         pos = unit.get("position")
         unit_type = unit.get("type", "?")
-        if not isinstance(pos, int):
+        # a type that is no string is reported above (and unhashable here)
+        if not isinstance(pos, int) or not isinstance(unit_type, str):
             continue
         if unit_type in BRANCH_TYPES:
             if_true = unit.get("if_true")

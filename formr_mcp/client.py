@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from typing import Any, Callable
 from urllib.parse import urljoin, quote
@@ -30,6 +31,12 @@ def resolve_timeout() -> httpx.Timeout:
 
 from formr_mcp.utils import validate_run_name, validate_survey_name
 from .auth import AuthError, OAuthToken, get_token
+
+
+def _log_path(path: str) -> str:
+    """A request path for the log: a session's code is a login to the
+    participant's session, so only its start goes there."""
+    return re.sub(r"(sessions/)([^/?]{6})[^/?]*", r"\1\2…", path)
 
 
 class FormrClientError(Exception):
@@ -75,6 +82,13 @@ def _segment(value: str) -> str:
     if value in ("", ".", ".."):
         raise ValueError(f"{value!r} is not a valid name here.")
     return quote(value, safe="")
+
+
+def _code_segment(code: str) -> str:
+    """A session's code in a formr API path. formr reads it from the raw
+    request path, undecoded (SessionResource), so a '+' the code may hold stays
+    a '+' (it is one in a path); everything else is encoded as in _segment."""
+    return _segment(code).replace("%2B", "+")
 
 
 class FormrClient:
@@ -158,13 +172,14 @@ class FormrClient:
                 "slow OpenCPU render — not the MCP or your token. Raise FORMR_HTTP_TIMEOUT to "
                 "wait longer, and check the instance's DB locks (SHOW PROCESSLIST) and logs."
             ) from e
-        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError) as e:
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError, httpx.DecodingError) as e:
             # sent, and the connection went before the answer (formr_app
-            # restarting, a proxy cut): formr may have carried it out
+            # restarting, a proxy cut), or the answer came with a broken
+            # Content-Encoding: formr may have carried it out
             log.warning("formr %s %s: no answer (%s)", method, path, type(e).__name__)
             raise FormrAnswerLost(f"{method} {path}: formr's answer was lost ({type(e).__name__}: {e}).") from e
 
-        log.info("formr %s %s -> %s (%.0fms)", method, path, resp.status_code,
+        log.info("formr %s %s -> %s (%.0fms)", method, _log_path(path), resp.status_code,
                  (time.perf_counter() - t0) * 1000)
 
         if resp.status_code == 401 and self._access_token is not None:
@@ -199,7 +214,16 @@ class FormrClient:
 
         ct = resp.headers.get("content-type", "")
         if "json" in ct:
-            return resp.json()
+            try:
+                return resp.json()
+            except ValueError as e:  # JSONDecodeError, UnicodeDecodeError
+                # a 2xx: formr carried it out, only its answer can't be read
+                # (no excerpt: a 2xx body may hold participants' data)
+                log.warning("formr %s %s -> %s: unreadable JSON (%s)", method, _log_path(path),
+                            resp.status_code, type(e).__name__)
+                raise FormrAnswerLost(
+                    f"{method} {path} -> {resp.status_code}, but formr's answer could not be read "
+                    f"({type(e).__name__}: {e}).", status=resp.status_code) from e
         return resp.text
 
     async def get_surveys(self, name: str | None = None) -> list[dict]:
@@ -272,21 +296,30 @@ class FormrClient:
         if self._capabilities is None or refresh:
             if self._access_token is not None:
                 # a connection's token may lack user:read; /user/token needs none
-                info = await self.get_token_info()
-                if not isinstance(info, dict):
-                    raise FormrClientError("formr's GET /api/v1/user/token answered with no token information.")
-                self._capabilities = {
-                    "id": info.get("account_id"),
-                    "email": info.get("email"),
-                    "connection": info.get("label"),
-                    "scopes": info.get("scopes") or [],
-                    # names only with run:read; else formr gives the ids
-                    "allowed_runs": [r if isinstance(r, dict) else {"id": r, "name": f"run #{r}"}
-                                     for r in info["allowed_runs"]] if info.get("allowed_runs") else None,
-                }
+                self._capabilities = await self._token_capabilities()
             else:
-                self._capabilities = await self.get_user_me()
+                try:
+                    self._capabilities = await self.get_user_me()
+                except FormrPermissionError:
+                    # a credential without user:read (no guide lists it): what
+                    # /user/token says, which needs none; whoami's 403 sent the
+                    # model to whoami
+                    self._capabilities = await self._token_capabilities()
         return self._capabilities
+
+    async def _token_capabilities(self) -> dict:
+        info = await self.get_token_info()
+        if not isinstance(info, dict):
+            raise FormrClientError("formr's GET /api/v1/user/token answered with no token information.")
+        return {
+            "id": info.get("account_id"),
+            "email": info.get("email"),
+            "connection": info.get("label"),
+            "scopes": info.get("scopes") or [],
+            # names only with run:read; else formr gives the ids
+            "allowed_runs": [r if isinstance(r, dict) else {"id": r, "name": f"run #{r}"}
+                             for r in info["allowed_runs"]] if info.get("allowed_runs") else None,
+        }
 
     def _permission_message(self, method: str, path: str, resp: httpx.Response) -> str:
         server_msg = ""
@@ -337,7 +370,7 @@ class FormrClient:
     async def get_session(self, run: str, code: str) -> dict:
         validate_run_name(run)
         return await self.request(
-            "GET", f"api/v1/runs/{_segment(run)}/sessions/{_segment(code)}"
+            "GET", f"api/v1/runs/{_segment(run)}/sessions/{_code_segment(code)}"
         )
 
     async def get_unit_sessions(
@@ -415,7 +448,7 @@ class FormrClient:
             body["position"] = position
         return await self.request(
             "POST",
-            f"api/v1/runs/{_segment(run)}/sessions/{_segment(code)}/actions",
+            f"api/v1/runs/{_segment(run)}/sessions/{_code_segment(code)}/actions",
             json=body,
         )
 

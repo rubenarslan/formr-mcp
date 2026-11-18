@@ -355,7 +355,7 @@ class TestNoWorkspace:
         assert server_mod._run_edit_lock("SOME-run") is lock
         del lock
         gc.collect()
-        assert "some-run" not in server_mod._RUN_EDIT_LOCKS
+        assert not any(key[1] == "some-run" for key in server_mod._RUN_EDIT_LOCKS), "keyed (account, name)"
         with pytest.raises(ValueError):
             server_mod._run_edit_lock("../x")
 
@@ -655,3 +655,226 @@ class TestHostedToolsSayWhatTheyDo:
         report, ticks = _run(both())
         assert report == "report" and seen == ["Endpage"], "the thread sees the structure fetched for the call"
         assert max(b - a for a, b in zip(ticks, ticks[1:])) < 0.2, "no 0.3 s stall"
+
+
+
+# --- review round 4 ---------------------------------------------------------
+
+class TestRound4:
+    STRUCTURE = {"name": "demo", "units": [
+        {"type": "Pause", "position": 5, "description": "wait", "body": "Later", "wait_minutes": 1, "run_unit_id": 7},
+        {"type": "Endpage", "position": 10, "description": "end", "body": "Bye", "run_unit_id": 8}]}
+    _client = TestNoWorkspace._client
+
+    def test_a_settings_update_says_what_formr_skipped(self, monkeypatch):
+        warning = "The expiry date cannot be set to a past date."
+        c = AsyncMock()
+        c.patch_run.return_value = {"warnings": warning}
+        c.get_run.return_value = {"name": "demo", "expiresOn": None}
+        monkeypatch.setattr(server_mod, "_client", lambda ctx: c)
+        out = _run(server_mod.update_run_settings("demo", {"expiresOn": "2020-01-01"}, ctx=MagicMock()))
+        assert out["warnings"] == warning and out["expiresOn"] is None
+        c.get_run.side_effect = server_mod.FormrPermissionError("GET ... 403")
+        out = _run(server_mod.update_run_settings("demo", {"expiresOn": "2020-01-01"}, ctx=MagicMock()))
+        assert out["warnings"] == warning and "skipped or changed" in out["note"]
+        c.patch_run.return_value = []   # formr's 200 without warnings is an empty JSON list
+        c.get_run.side_effect = None
+        assert "warnings" not in _run(server_mod.update_run_settings("demo", {"title": "T"}, ctx=MagicMock()))
+
+    def test_a_saved_setting_whose_read_back_fails_is_not_repeated(self, monkeypatch):
+        c = AsyncMock()
+        c.patch_run.return_value = []
+        c.get_run.side_effect = FormrClientError("GET api/v1/runs/demo -> 502: Bad Gateway", status=502)
+        monkeypatch.setattr(server_mod, "_client", lambda ctx: c)
+        with pytest.raises(ValueError) as e:
+            _run(server_mod.update_run_settings("demo", {"title": "T"}, ctx=MagicMock()))
+        assert "saved the settings" in str(e.value) and "Do not repeat" in str(e.value)
+        c.patch_run.assert_awaited_once()
+
+    def test_while_formr_hangs_the_stale_answer_stands_from_the_end_of_the_wait(self, monkeypatch):
+        # the shared client's read time-out (60 s) is as long as the ttl: kept
+        # from before the wait, the answer was stale when stored
+        from formr_mcp import auth as auth_mod
+        clock = [1000.0]
+        monkeypatch.setattr(auth_mod, "time", SimpleNamespace(time=lambda: clock[0]))
+        calls = []
+        up = [True]
+
+        def handler(request):
+            calls.append(1)
+            if not up[0]:
+                clock[0] += 60  # the read time-out passes
+                raise httpx.ReadTimeout("hangs")
+            return httpx.Response(200, json=_token_info())
+        verifier = FormrTokenVerifier(BASE, _formr(handler), resource=MCP_URL, ttl=60)
+        access = _run(verifier.verify_token(TOKEN))
+        clock[0] += 61  # the minute is over
+        up[0] = False
+        assert _run(verifier.verify_token(TOKEN)) == access
+        assert _run(verifier.verify_token(TOKEN)) == access
+        assert len(calls) == 2, "one request waited on formr, not every one"
+
+    def test_a_token_forgotten_during_the_wait_is_not_cached_again(self):
+        verifier = FormrTokenVerifier(BASE, _formr(lambda r: httpx.Response(200, json=_token_info())),
+                                      resource=MCP_URL, ttl=60)
+        access = _run(verifier.verify_token(TOKEN))
+        key = verifier._key(TOKEN)
+        hit = (0, access)
+        verifier._cache[key] = hit
+        verifier.forget(TOKEN)  # formr refused it meanwhile (a tool's 401)
+        with pytest.raises(FormrUnavailable):
+            verifier._while_unavailable(key, hit, 0, "ReadTimeout")
+        assert key not in verifier._cache
+
+    def _ctx(self, receive):
+        from starlette.requests import Request
+        ctx = MagicMock()
+        ctx.request_context.request = Request(
+            {"type": "http", "method": "POST", "headers": [],
+             "user": SimpleNamespace(access_token=SimpleNamespace(subject="5"))}, receive)
+        return ctx
+
+    def test_a_caller_that_hung_up_uploads_nothing(self, http_mode):
+        # the SDK doesn't cancel a stateless JSON call whose client went: its
+        # upload would land, and the client's retry would make the edit twice
+        c = self._client(http_mode)
+
+        async def gone():
+            return {"type": "http.disconnect"}
+        with pytest.raises(ValueError, match="hung up"):
+            _run(server_mod.add_run_unit("demo", "Pause", 5, unit_fields={"wait_minutes": 1}, ctx=self._ctx(gone)))
+        c.put_run_structure.assert_not_awaited()
+
+    def test_a_caller_still_there_uploads(self, http_mode):
+        c = self._client(http_mode)
+
+        async def waiting():
+            await asyncio.Event().wait()
+        out = _run(server_mod.add_run_unit("demo", "Pause", 20, unit_fields={"wait_minutes": 1}, ctx=self._ctx(waiting)))
+        assert "successfully updated" in out
+        assert [u["type"] for u in c.put_run_structure.await_args.args[1]["units"]] == ["Pause", "Endpage", "Pause"]
+
+    @pytest.mark.parametrize("answer", [
+        lambda r: httpx.Response(200, headers={"content-type": "application/json"}, content=b'{"kept": 1, "cre'),
+        lambda r: httpx.Response(201, headers={"content-type": "application/json"}, content=b'{"a": "\xff"}'),
+        lambda r: httpx.Response(200, headers={"content-type": "application/json", "content-encoding": "gzip"},
+                                 content=b"not gzip"),
+    ])
+    def test_an_unreadable_answer_is_a_lost_answer(self, answer):
+        client = FormrClient(BASE, http_client=_formr(answer), access_token=TOKEN)
+        with pytest.raises(FormrAnswerLost):
+            _run(client.put_run_structure("demo", {"units": []}))
+
+    def test_no_app_is_served_without_the_token_check(self):
+        import http_server
+        from starlette.applications import Starlette
+        from starlette.routing import Route
+        verifier = FormrTokenVerifier(BASE, _formr(lambda r: httpx.Response(500)), resource=MCP_URL)
+        unguarded = Starlette(routes=[Route("/mcp", endpoint=lambda request: None)])
+        with pytest.raises(SystemExit, match="token check"):
+            http_server._require_token_check(unguarded, verifier, "/mcp")
+
+    def test_a_public_url_without_its_path_is_refused(self, monkeypatch):
+        import http_server
+        monkeypatch.setenv("FORMR_BASE_URL", BASE)
+        monkeypatch.setenv("MCP_PUBLIC_URL", "https://mcp.example.org")
+        with pytest.raises(SystemExit, match="path"):
+            http_server.build_app()
+
+    def _answering(self, http_mode, answer):
+        c = self._client(http_mode)
+        put = c.put_run_structure.side_effect
+
+        async def put_and_answer(name, structure, confirm_removal=False):
+            await put(name, structure, confirm_removal)
+            return answer
+        c.put_run_structure.side_effect = put_and_answer
+        return c
+
+    def test_formrs_counts_in_warnings_are_hidden_under_test_only(self, http_mode):
+        http_mode.setattr(server_mod.gate, "data_access_mode", lambda: server_mod.gate.TEST_ONLY)
+        self._answering(http_mode, {"kept": 1, "warnings": "The showif of q1 changed: 37 pending item view(s) "
+                                                          "in unfinished sessions will re-evaluate it."})
+        out = _run(server_mod.add_run_unit("demo", "Pause", 5, unit_fields={"wait_minutes": 1}, ctx=MagicMock()))
+        assert "37" not in out and "q1" in out and "counts hidden" in out
+
+    def test_a_go_ahead_inside_the_structure_is_not_passed_on(self, http_mode):
+        c = self._client(http_mode)
+        structure = dict(self.STRUCTURE, confirm_removal=True)
+        _run(server_mod.update_run_structure("demo", json.dumps(structure), ctx=MagicMock()))
+        sent = c.put_run_structure.await_args
+        assert "confirm_removal" not in sent.args[1]
+        assert sent.kwargs.get("confirm_removal") is False
+
+    def test_a_copy_of_another_run_is_told_to_leave_the_version_out(self, http_mode):
+        c = self._client(http_mode)
+        c.put_run_structure.side_effect = FormrConflict("PUT ... -> 409", body={"version": "theirs"})
+        with pytest.raises(ValueError, match='leave "version" out'):
+            _run(server_mod.update_run_structure("demo", json.dumps(dict(self.STRUCTURE, version="v1")), ctx=MagicMock()))
+
+    def test_saved_survey_items_send_the_confirmed_retry_to_a_fresh_copy(self, http_mode):
+        c = self._client(http_mode)
+        c.put_run_structure.side_effect = FormrConflict("PUT ... -> 409", body={
+            "units_in_use": [{"position": 10, "type": "Endpage", "description": "end"}], "surveys_saved": ["diary"]})
+        with pytest.raises(ValueError, match="fetch the run again"):
+            _run(server_mod.update_run_structure("demo", json.dumps(self.STRUCTURE), ctx=MagicMock()))
+
+    @pytest.mark.parametrize("fields", [{"type": "SkipForward"}, {"run_unit_id": 3}, {"position": 40}])
+    def test_unit_fields_do_not_set_what_the_tools_arguments_do(self, http_mode, fields):
+        c = self._client(http_mode)
+        with pytest.raises(ValueError, match="unit_fields may not set"):
+            _run(server_mod.add_run_unit("demo", "Page", 20, unit_fields=dict(fields, body="x"), ctx=MagicMock()))
+        c.put_run_structure.assert_not_awaited()
+
+    def test_a_description_may_come_in_unit_fields(self, http_mode):
+        c = self._client(http_mode)
+        _run(server_mod.add_run_unit("demo", "Pause", 20, unit_fields={"description": "Thanks", "wait_minutes": 1},
+                                     ctx=MagicMock()))
+        assert c.put_run_structure.await_args.args[1]["units"][2]["description"] == "Thanks"
+
+    def test_an_overwrite_with_another_survey_is_a_new_unit(self, http_mode):
+        # a run_unit_id kept on another study made the validator take it for a
+        # survey formr has, and let its Custom Paging through
+        self._client(http_mode, {"name": "demo", "units": [
+            {"type": "Survey", "position": 10, "run_unit_id": 7, "survey_data": {"name": "diary", "items": []}},
+            {"type": "Endpage", "position": 20, "body": "Bye", "run_unit_id": 8}]})
+        with pytest.raises(ValueError, match="use_paging"):
+            _run(server_mod.add_run_unit("demo", "Survey", 10, insert_mode="overwrite", unit_fields={
+                "survey_data": {"name": "brand_new", "items": [{"type": "note", "name": "hello", "label": "Hi"}],
+                                "settings": {"use_paging": 1}}}, ctx=MagicMock()))
+
+
+def test_a_session_code_keeps_its_plus_in_the_path():
+    # formr reads the code from the raw path, undecoded (SessionResource)
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.raw_path.decode())
+        return httpx.Response(200, json={"session": "x", "testing": 1})
+    client = FormrClient(BASE, http_client=_formr(handler), access_token=TOKEN)
+    _run(client.get_session("demo", "Ab+cd/e"))
+    assert seen == ["/api/v1/runs/demo/sessions/Ab+cd%2Fe"]
+
+
+def test_a_session_code_is_not_logged_whole(caplog):
+    import logging
+    from formr_mcp.logsetup import _preview
+    client = FormrClient(BASE, http_client=_formr(lambda r: httpx.Response(200, json={})), access_token=TOKEN)
+    code = "Q" * 64
+    with caplog.at_level(logging.INFO, logger="formr_mcp.client"):
+        _run(client.get_session("demo", code))
+    assert code not in caplog.text and "sessions/QQQQQQ…" in caplog.text
+    assert code not in _preview({"name": "demo", "code": code}) and code[:10] not in _preview({"codes": [code]})
+
+
+def test_a_hosted_sheet_goes_through_the_shared_client_with_a_cap(http_mode):
+    seen = {}
+
+    async def fake(url, fmt, to_file, http_client=None, max_bytes=None):
+        seen.update(http_client=http_client, max_bytes=max_bytes)
+        return "a\n"
+    http_mode.setattr(server_mod.gsheets, "fetch_google_sheet", fake)
+    http_mode.setattr(server_mod, "_shared_http", None)
+    assert _run(server_mod.fetch_google_sheet("https://docs.google.com/spreadsheets/d/x/edit")) == "a\n"
+    assert seen["http_client"] is server_mod.shared_http()
+    assert seen["max_bytes"] == server_mod.gsheets.MAX_SHEET_BYTES

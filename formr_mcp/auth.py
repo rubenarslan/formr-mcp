@@ -198,7 +198,9 @@ class FormrTokenVerifier:
             self._cache = {k: v for k, v in self._cache.items() if v[0] > now}
             if len(self._cache) >= self._max_entries:
                 self._cache.clear()
-        until = now + self._ttl
+        # from now, after the wait on formr: an answer that took long is
+        # cached for the whole ttl all the same
+        until = time.time() + self._ttl
         if expires is not None:
             until = min(until, expires)
         self._cache[key] = (until, access)
@@ -208,10 +210,14 @@ class FormrTokenVerifier:
         """formr did not answer: its last answer for this token while the token
         itself is unexpired (formr checks it again on every tool call anyway),
         else FormrUnavailable."""
-        if hit is not None and hit[1].expires_at and hit[1].expires_at > now:
+        # not when forget() dropped the entry during the wait (formr refused
+        # the token since): that answer stands for no one any more
+        if hit is not None and self._cache.get(key) is hit and hit[1].expires_at and hit[1].expires_at > now:
             log.warning("token check: formr unavailable (%s), its last answer is used", why)
             # for another while: the next request would wait on formr as long again
-            self._cache[key] = (min(now + self._ttl, hit[1].expires_at), hit[1])
+            # (from the end of the wait: formr's time-out is as long as the ttl,
+            # and an entry dated from before it was stale when stored)
+            self._cache[key] = (min(time.time() + self._ttl, hit[1].expires_at), hit[1])
             return hit[1]
         log.warning("token check: formr unavailable (%s)", why)
         raise FormrUnavailable(f"formr is not answering ({why}); try again shortly.")

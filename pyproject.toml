@@ -14,3 +14,8 @@ dependencies = [
 test = [
     "pytest>=9.0.3",
 ]
+
+[tool.pytest.ini_options]
+# tests/test_integration_runs.py creates and deletes runs on the formr of the
+# .env: only with `-m integration`
+addopts = "-m 'not integration'"
