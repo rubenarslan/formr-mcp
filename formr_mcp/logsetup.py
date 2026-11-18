@@ -17,7 +17,8 @@ import sys
 import time
 
 _LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
-_SENSITIVE = ("secret", "token", "password")
+# a session's code is a login to the participant's session
+_SENSITIVE = ("secret", "token", "password", "code", "session")
 
 
 def _level_from_env() -> int:

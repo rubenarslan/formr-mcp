@@ -1437,6 +1437,12 @@ Send a reminder if participant hasn't responded within 60 minutes.
             "account_id": 2,
             "body": "Hey,\r\n\r\ndidn't you forget about your favourite study?\r\n{{login_link}}",
             "cron_only": 1
+        },
+        {
+            "type": "Endpage",
+            "description": "Thanks",
+            "position": 30,
+            "body": "Thank you for taking part!"
         }
     ]
 }
@@ -1750,7 +1756,9 @@ formr (v2.0.0-rc13 and later) changes only what an upload changes:
   participants stay on it, moving along when its position changes. Leave it out
   for a new unit and never copy it to another (`duplicate_run_units` drops it).
 - Keep the structure's `version`: formr refuses an upload made from a copy that
-  changed in formr meanwhile. Fetch again and redo the change then.
+  changed in formr meanwhile. Fetch again and redo the change then. An upload
+  without it overwrites, unchecked (leave it out only to put another run's
+  structure into this one).
 - A unit left out is removed, and its participants go on to whatever now stands
   in its place. Where real participants are at it, formr refuses unless the call
   passes `confirm_removal=true` (`remove_run_unit`, `update_run_structure`,
@@ -2330,7 +2338,7 @@ The MCP can read a live run directly — useful while designing or debugging:
 |------|---------|-------|
 | `list_sessions` / `get_session` | who is in the run, position, ended, testing flag | session:read |
 | `list_unit_sessions` | per-unit history: progress, dropout, trajectories | session:read |
-| `get_run_results` | raw survey responses (filter by survey/session/item) | data:read |
+| `get_run_results` | raw survey responses (filter by survey/session/item) | data:read (+ session:read under test_only or with `testing`) |
 | `list_run_files` | uploaded-file metadata | file:read |
 | `get_survey_structure` | item tables + choice lists (definitions, not data) | survey:read |
 | `get_run_logs` | the engine's logs: per-unit result + result_log (R errors), email log, push log | session:read + data:read |
@@ -2339,9 +2347,9 @@ And to try a run out and maintain its files:
 
 | Tool | Does | Scope |
 |------|------|-------|
-| `create_test_sessions` | new **test** sessions (random or given codes) with their test links | session:write |
-| `test_session_action` | advance / execute / move_to_position / end_external — test sessions only | session:write |
-| `upload_run_file` / `delete_run_file` | a run's files (from the workspace, text, or base64) | file:write |
+| `create_test_sessions` | new **test** sessions (random or given codes) with their test links | session:write + run:read |
+| `test_session_action` | advance / execute / move_to_position / end_external — test sessions only | session:write + session:read |
+| `upload_run_file` / `delete_run_file` | a run's files (from the workspace, text, or base64) | file:write (+ file:read for the URL) |
 
 **Testing a run end to end:** `create_test_sessions` → open the returned `test_link` in a
 browser (Playwright) and answer as a participant → `test_session_action` to skip a Pause or
@@ -2724,13 +2732,13 @@ These live on the study (`survey_studies`), not on the unit:
 | `layout` | `default` \| `solo` | scrolling page vs. one-item-per-screen |
 | `language` | BCP 47, default `en` | engine-chrome strings (**`en` and `de` only**) |
 
-**They are read-only over the API.** The structure export shows them under
-`survey_data.settings`, but formr's import allowlist
-(`SurveyStudy::createFromData`) does not include them — uploading a changed
-value is silently ignored. Change them in the admin UI
-(`/admin/survey/<name>` → "Form_v2 settings"); a new survey sent as a `Form`
-unit's `survey_data` is created on v2. Placing an existing study as a `Form`
-changes nothing.
+**A new survey takes them from the upload; an existing one keeps its own.** The
+structure export shows them under `survey_data.settings`, and formr's import
+(`SurveyStudy::createFromData`) applies them when it creates the survey; for a
+survey formr already has, a changed value is ignored. Change an existing
+survey's in the admin UI (`/admin/survey/<name>` → "Form_v2 settings"); a new
+survey sent as a `Form` unit's `survey_data` is created on v2. Placing an
+existing study as a `Form` changes nothing.
 
 `language` only translates the engine's own chrome (nav buttons, save pill,
 offline banners, validation fallbacks). Item labels and choices are whatever the

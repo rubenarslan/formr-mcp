@@ -75,27 +75,39 @@ def _not_shared(export: str) -> GoogleSheetError:
     )
 
 
-async def _fetch(url: str, fmt: str, http_client: httpx.AsyncClient | None):
+# The most of a sheet a hosted server reads: it holds the export in memory and
+# returns it to the model as text. Google allows a spreadsheet 10 million cells.
+MAX_SHEET_BYTES = 5_000_000
+_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
+
+
+async def _fetch(url: str, fmt: str, http_client: httpx.AsyncClient | None,
+                 max_bytes: int | None = None):
     parsed = parse_sheet_url(url)
     export = export_url(parsed, fmt)
-    client = http_client or httpx.AsyncClient(
-        follow_redirects=True, timeout=httpx.Timeout(60.0, connect=10.0)
-    )
+    client = http_client or httpx.AsyncClient(follow_redirects=True, timeout=_TIMEOUT)
     try:
-        resp = await client.get(export)
+        # per request, so that a shared client (formr's: no redirects) works too
+        async with client.stream("GET", export, follow_redirects=True, timeout=_TIMEOUT) as resp:
+            if resp.status_code in (401, 403):
+                raise _not_shared(export)
+            if resp.status_code == 404:
+                raise GoogleSheetError(f"Sheet not found (404). Check the ID/URL. Tried: {export}")
+            if not resp.is_success:
+                raise GoogleSheetError(f"Failed to fetch sheet ({resp.status_code}). Tried: {export}")
+            if "text/html" in resp.headers.get("content-type", ""):
+                raise _not_shared(export)
+            content = bytearray()
+            async for chunk in resp.aiter_bytes():
+                content += chunk
+                if max_bytes is not None and len(content) > max_bytes:
+                    raise GoogleSheetError(
+                        f"The sheet is larger than {max_bytes / 1e6:g} MB, more than this server returns. "
+                        f"Link a single tab (its #gid=) or a smaller sheet. Tried: {export}")
     finally:
         if http_client is None:
             await client.aclose()
-
-    if resp.status_code in (401, 403):
-        raise _not_shared(export)
-    if resp.status_code == 404:
-        raise GoogleSheetError(f"Sheet not found (404). Check the ID/URL. Tried: {export}")
-    if not resp.is_success:
-        raise GoogleSheetError(f"Failed to fetch sheet ({resp.status_code}). Tried: {export}")
-    if "text/html" in resp.headers.get("content-type", ""):
-        raise _not_shared(export)
-    return resp.content, export, parsed
+    return bytes(content), export, parsed
 
 
 async def fetch_google_sheet(
@@ -103,11 +115,12 @@ async def fetch_google_sheet(
     fmt: str = CSV,
     to_file: bool = False,
     http_client: httpx.AsyncClient | None = None,
+    max_bytes: int | None = None,
 ) -> str:
     """Fetch a sheet. CSV returns text (unless to_file); XLSX is always a file."""
     if fmt not in (CSV, XLSX):
         raise GoogleSheetError(f"format must be 'csv' or 'xlsx', got {fmt!r}")
-    content, export, parsed = await _fetch(url, fmt, http_client)
+    content, export, parsed = await _fetch(url, fmt, http_client, max_bytes)
 
     if fmt == CSV and not to_file:
         return content.decode("utf-8-sig", errors="replace")

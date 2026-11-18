@@ -123,3 +123,29 @@ class TestFetch:
     def test_bad_format(self):
         with pytest.raises(GoogleSheetError, match="format must be"):
             asyncio.run(fetch_google_sheet(EDIT_URL, "pdf"))
+
+
+class TestRound4Fetch:
+    def test_a_sheet_over_the_cap_is_refused_unread(self):
+        sent = []
+
+        async def body():
+            for _ in range(100):
+                sent.append(1)
+                yield b"x" * 100_000
+
+        http = _client(lambda request: httpx.Response(200, headers={"content-type": "text/csv"}, content=body()))
+        with pytest.raises(GoogleSheetError, match="larger than"):
+            asyncio.run(fetch_google_sheet(EDIT_URL, "csv", http_client=http, max_bytes=1_000_000))
+        assert len(sent) < 100, "the rest of the export is not read"
+        asyncio.run(http.aclose())
+
+    def test_googles_redirect_is_followed_on_a_shared_client(self):
+        def handler(request):
+            if request.url.host == "docs.google.com":
+                return httpx.Response(307, headers={"location": "https://doc-0s-sheets.googleusercontent.com/export/x"})
+            return httpx.Response(200, headers={"content-type": "text/csv"}, content=b"a\n1\n")
+
+        http = _client(handler)          # follow_redirects=False, as server.shared_http()
+        assert asyncio.run(fetch_google_sheet(EDIT_URL, "csv", http_client=http)) == "a\n1\n"
+        asyncio.run(http.aclose())

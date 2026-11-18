@@ -98,9 +98,45 @@ class TestGetResultsGated:
         client.get_results.return_value = {}
         asyncio.run(get_results_gated(client, "my-run"))
         assert client.get_sessions.call_count == 2
-        _, kwargs = client.get_results.call_args
-        assert "TLAST" in kwargs["sessions"]
-        assert len(kwargs["sessions"]) == 10001
+        sent = [kw["sessions"] for _, kw in client.get_results.call_args_list]
+        assert "TLAST" in sent[-1]
+        assert sum(len(batch) for batch in sent) == 10001, "every code, in batches"
+
+    def test_rows_whose_code_only_begins_with_an_allowed_one_are_dropped(self, monkeypatch):
+        # formr matches each `sessions` entry as a case-insensitive prefix
+        # (session LIKE 'code%'): a real session P0010 comes with test session P001
+        monkeypatch.setenv("FORMR_DATA_ACCESS", "test_only")
+        client = AsyncMock()
+        client.get_sessions.return_value = [{"session": "P001"}]
+        client.get_results.return_value = {
+            "diary": [{"session": "P001", "mood": 3}, {"session": "P0010", "mood": 1}, {"session": "p001-late", "mood": 2}],
+            "shuffles": [{"run_session": "P001", "group": 1}, {"run_session": "P0011", "group": 2}],
+        }
+        out = asyncio.run(get_results_gated(client, "my-run"))
+        assert out == {"diary": [{"session": "P001", "mood": 3}], "shuffles": [{"run_session": "P001", "group": 1}]}
+
+    def test_an_answer_that_is_no_object_returns_nothing(self, monkeypatch):
+        monkeypatch.setenv("FORMR_DATA_ACCESS", "test_only")
+        client = AsyncMock()
+        client.get_sessions.return_value = [{"session": "P001"}]
+        client.get_results.return_value = [{"session": "P0010"}]
+        with pytest.raises(DataAccessError):
+            asyncio.run(get_results_gated(client, "my-run"))
+
+    def test_many_codes_go_in_requests_formr_takes(self, monkeypatch):
+        # one GET with every code: Apache's 8190-byte request line (414) from
+        # ~120 codes of 64 characters, httpx's InvalidURL from ~980
+        monkeypatch.setenv("FORMR_DATA_ACCESS", "test_only")
+        codes = [f"{i:064d}" for i in range(300)]
+        client = AsyncMock()
+        client.get_sessions.return_value = [{"session": c} for c in codes]
+        client.get_results.side_effect = lambda run, surveys=None, sessions=None, items=None: {
+            "diary": [{"session": c} for c in sessions]}
+        out = asyncio.run(get_results_gated(client, "my-run"))
+        batches = [kw["sessions"] for _, kw in client.get_results.call_args_list]
+        assert len(batches) > 1
+        assert max(len(",".join(b)) for b in batches) < 6500
+        assert [r["session"] for r in out["diary"]] == codes, "each row once"
 
 
 class TestPermissionError:
@@ -210,3 +246,29 @@ class TestServerGate:
         with pytest.raises(DataAccessError):
             asyncio.run(server_mod.list_sessions("my-run", testing=False, ctx=MagicMock()))
         mock_client.get_sessions.assert_not_called()
+
+
+def test_a_testing_filter_needs_session_read_in_all_mode(monkeypatch):
+    # testing=True/False finds the matching sessions first (get_results_gated)
+    monkeypatch.setenv("FORMR_DATA_ACCESS", "all")
+    access = server_mod._build_capability_report({"scopes": ["data:read"]}, [])["tool_access"]
+    assert access["get_run_results"].startswith("available")
+    assert "session:read" in access["get_run_results"] and "testing" in access["get_run_results"]
+    both = server_mod._build_capability_report({"scopes": ["data:read", "session:read"]}, [])["tool_access"]
+    assert both["get_run_results"] == "available"
+
+
+def test_whoami_without_user_read_asks_the_token_endpoint(monkeypatch):
+    # a local credential made with the README's scopes has no user:read: /user/me
+    # refused whoami, and the refusal sent the model to whoami
+    client = FormrClient("https://formr.example.org", client_id="id", client_secret="secret")
+
+    async def me():
+        raise FormrPermissionError("GET api/v1/user/me -> 403")
+
+    async def token_info():
+        return {"account_id": 5, "scopes": ["run:read"], "allowed_runs": [3]}
+    monkeypatch.setattr(client, "get_user_me", me)
+    monkeypatch.setattr(client, "get_token_info", token_info)
+    caps = asyncio.run(client.get_capabilities())
+    assert caps["scopes"] == ["run:read"] and caps["allowed_runs"] == [{"id": 3, "name": "run #3"}]

@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import weakref
 import webbrowser
 from contextlib import asynccontextmanager
@@ -20,6 +21,7 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import Context
 from mcp.types import ToolAnnotations
+from starlette.requests import Request
 
 # Load .env before importing project modules — they read env vars at import time
 dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -57,11 +59,12 @@ from formr_mcp.utils import (
     run_filepath,
     save_structure,
     validate_run_name,
+    validate_new_run_name,
     workspace_file,
 )
 from formr_mcp.validation import SURVEY_UNIT_TYPES, get_unit_type_schemas, validate_structure
 
-RunName = Annotated[str, Field(pattern=r"^[a-zA-Z][a-zA-Z0-9-]{2,255}$", min_length=3, max_length=256)]
+RunName = Annotated[str, Field(pattern=r"^[a-zA-Z][a-zA-Z0-9_-]{2,44}$", min_length=3, max_length=45)]
 
 BASE_URL = os.getenv("FORMR_BASE_URL", "")
 CLIENT_ID = os.getenv("FORMR_CLIENT_ID", "")
@@ -107,8 +110,10 @@ _HTTP_STRUCTURE_READ_TOOLS = ("summarize_run", "find_run_items", "analyze_run")
 _HTTP_STRUCTURE_EDIT_TOOLS = ("add_run_unit", "remove_run_unit", "duplicate_run_units",
                               "shift_run_positions", "renormalize_positions")
 _WRITE_SCOPES = {"run:write", "run:delete", "survey:write", "session:write", "user:write", "file:write"}
-# Tools that also call an endpoint of another scope: without it the write
-# lands and the tool fails after, and a retry writes again.
+# Tools that also call an endpoint of another scope. They read first where
+# they can (create_test_sessions, test_session_action), and where the read
+# comes after the write (update_run_settings, upload_run_file) a refused read
+# is no failure: the write is reported done.
 _ALSO_NEEDS = {
     "get_run_logs": "session:read",
     "create_test_sessions": "run:read",
@@ -161,10 +166,15 @@ def _build_capability_report(caps: dict, token_scopes: list[str]) -> dict:
                 tool_access[tool] = f"blocked: requires '{scope}' scope"
         elif tool in _ALSO_NEEDS and _ALSO_NEEDS[tool] not in scope_set:
             tool_access[tool] = f"blocked: requires '{_ALSO_NEEDS[tool]}' and '{scope}' scopes"
-        elif tool == "get_run_results" and mode == gate.TEST_ONLY and "session:read" not in scope_set:
-            # test_only finds the run's test sessions first (data_access.get_results_gated)
-            tool_access[tool] = ("blocked: requires 'session:read' and 'data:read' scopes "
-                                 "(FORMR_DATA_ACCESS=test_only looks up the test sessions first)")
+        elif tool == "get_run_results" and "session:read" not in scope_set:
+            if mode == gate.TEST_ONLY:
+                # test_only finds the run's test sessions first (data_access.get_results_gated)
+                tool_access[tool] = ("blocked: requires 'session:read' and 'data:read' scopes "
+                                     "(FORMR_DATA_ACCESS=test_only looks up the test sessions first)")
+            else:
+                # a testing filter finds the matching sessions first (data_access.get_results_gated)
+                tool_access[tool] = ("available without `testing`; testing=true/false requires "
+                                     "'session:read' too (it looks up the sessions first)")
         elif tool in ("get_run_results", "get_run_logs") and mode == gate.TEST_ONLY:
             tool_access[tool] = "available: TEST sessions only (FORMR_DATA_ACCESS=test_only)"
         else:
@@ -246,11 +256,11 @@ READING DATA — six read tools inspect a live run (handy for designing/debuggin
 TESTING A RUN — create_test_sessions(name) returns test codes with their links; open a link
 in a browser (Playwright) to take the run as that participant; test_session_action moves a
 test session on (advance past a Pause, move_to_position, execute); then list_unit_sessions,
-get_run_results and get_run_logs show what happened. Real participants are never changed.
+get_run_results and get_run_logs show what happened. test_session_action refuses real participants' sessions.
 RUN FILES — upload_run_file (from the workspace, text or base64) / delete_run_file.
-DATA GATE (GDPR): FORMR_DATA_ACCESS sets a HARD ceiling, default `test_only` —
-only test sessions (testing=1) are ever readable; reads of real participant data
-are refused until an operator sets FORMR_DATA_ACCESS=all and restarts. For
+DATA GATE (GDPR): FORMR_DATA_ACCESS sets a HARD ceiling on what this server's read tools
+return, default `test_only` — they return test sessions (testing=1) only and refuse real
+participant data until the server's operator sets FORMR_DATA_ACCESS=all and restarts. For
 full-scale analysis prefer emitting R code for RStudio (see data-access docs).
 
 formr is a survey framework for psychology research. Runs are ordered
@@ -341,11 +351,11 @@ async def list_runs(name: RunName | None = None, ctx: Context = None) -> list[di
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def create_run(name: RunName, ctx: Context = None) -> dict:
-    """Create a new run. Name must start with a letter, contain only letters, digits, hyphens, and be 3-256 chars.
+    """Create a new run. Name must start with a letter, contain only letters, digits, hyphens, and be 3-45 chars.
 
     Returns the created run name and link on success. Requires `run:write` OAuth scope.
     """
-    validate_run_name(name)
+    validate_new_run_name(name)
     client = _client(ctx)
     return await client.create_run(name)
 
@@ -366,7 +376,7 @@ async def get_run(name: RunName, ctx: Context = None) -> dict:
     return await _client(ctx).get_run(name)
 
 
-@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True, openWorldHint=False))
 async def update_run_settings(name: RunName, settings: dict, ctx: Context = None) -> dict:
     """Update a run's settings. Pass only the settings you want to change.
 
@@ -401,15 +411,32 @@ async def update_run_settings(name: RunName, settings: dict, ctx: Context = None
         # not in the middle of a unit tool's fetch, edit, upload of this run,
         # whose upload carries the run's settings as they were
         async with _run_edit_lock(name, _caller_account(ctx)):
-            await client.patch_run(name, settings)
+            answer = await client.patch_run(name, settings)
     else:
-        await client.patch_run(name, settings)
+        answer = await client.patch_run(name, settings)
+    # formr saves what it can and says what it skipped or changed (an expiry
+    # date in the past, unreadable or beyond the maximum, a file it could not
+    # write, a public run made private): the run read back does not say why
+    warnings = answer.get("warnings") if isinstance(answer, dict) else None
     try:
-        return await client.get_run(name)
+        run = await client.get_run(name)
     except FormrPermissionError:
         # saved all the same: a 403 here was taken for a failed save, and repeated
-        return {"name": name, "updated": sorted(settings),
-                "note": "Saved. Reading the run back needs the 'run:read' scope, which this token lacks."}
+        if not warnings:
+            return {"name": name, "updated": sorted(settings),
+                    "note": "Saved. Reading the run back needs the 'run:read' scope, which this token lacks."}
+        return {"name": name, "updated": sorted(settings), "warnings": warnings,
+                "note": ("Saved, but formr skipped or changed some of it: see warnings. Reading the "
+                         "run back needs the 'run:read' scope, which this token lacks.")}
+    except (FormrClientError, httpx.HTTPError) as e:
+        said = f" (formr says: {warnings})" if warnings else ""
+        raise ValueError(
+            f"Run '{name}': formr saved the settings{said}, but reading the run back failed ({e}). "
+            "Do not repeat the change: get_run shows the run as saved."
+        ) from e
+    if warnings and isinstance(run, dict):
+        return {**run, "warnings": warnings}
+    return run
 
 
 def _format_size(bytes: int) -> str:
@@ -453,7 +480,8 @@ def _normalize_survey_choices(structure: dict) -> None:
     expects.  Without this, items with choices but no choice_list are silently
     dropped by the server."""
     for unit in structure.get("units", []):
-        if unit.get("type") in SURVEY_UNIT_TYPES and isinstance(unit.get("survey_data"), dict):
+        # a type that is no string (a list: unhashable) is the validator's to report
+        if isinstance(unit.get("type"), str) and unit["type"] in SURVEY_UNIT_TYPES and isinstance(unit.get("survey_data"), dict):
             items = unit["survey_data"].get("items", [])
             if isinstance(items, list):
                 for item in items:
@@ -496,6 +524,9 @@ async def _upload_structure(client: FormrClient, name: str, structure: dict,
         raise ValueError(
             "Structure validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
         )
+    # formr also takes the go-ahead from the body: only the tool's parameter,
+    # which the user sees, gives it
+    structure.pop("confirm_removal", None)
     try:
         answer = await client.put_run_structure(name, structure, confirm_removal=confirm_removal)
     except FormrConflict as e:
@@ -512,13 +543,16 @@ async def _upload_structure(client: FormrClient, name: str, structure: dict,
                 "then stands in its place. If a unit was left out by mistake, keep it (with its run_unit_id). "
                 "Otherwise tell the user which units, and that participants are at them; only with their "
                 f"go-ahead, {confirm_hint}."
+                + (" The saved items changed the run's version: fetch the run again and make the change on "
+                   "that, or formr refuses the copy as stale." if saved else "")
             ) from e
         if "version" in e.body:
             # the version covers the run's units and settings (not its files)
             raise ValueError(
                 f"Run '{name}': nothing was uploaded. The run's units or settings have changed in formr since "
                 "it was fetched (in formr's editor, by another upload, or by update_run_settings). "
-                f"{stale_hint}: uploading the old copy would undo those changes."
+                f"{stale_hint}: uploading the old copy would undo those changes. (A structure copied "
+                'from another run carries that run\'s "version": leave "version" out to put it in this one.)'
             ) from e
         raise
     except FormrClientError as e:
@@ -544,7 +578,19 @@ async def _upload_structure(client: FormrClient, name: str, structure: dict,
     units = len(stored.get("units", []))
     message = f"Run '{name}': successfully updated ({units} units). " + _merge_summary(answer)
     if isinstance(answer, dict) and answer.get("warnings"):
-        message += f" formr says: {answer['warnings']}"
+        warnings = str(answer["warnings"])
+        if gate.data_access_mode() == gate.TEST_ONLY:
+            # formr's counts (pending item views after a changed showif) take
+            # in real participants too
+            warnings = re.sub(r"\b\d+\b", "#", warnings) + " (counts hidden: FORMR_DATA_ACCESS=test_only)"
+        message += f" formr says: {warnings}"
+    if structure.get("version") is None and isinstance(stored, dict) and stored.get("version"):
+        # formr checks for a stale copy only when the upload names the version
+        # it was made from (StructureResource: isset($jsonData->version)); a
+        # formr from before v2.0.0-rc13 exports none, and there is nothing to say
+        message += (' The upload had no "version", so formr did not check whether the run had changed since '
+                    "it was fetched: any change made in formr since then is undone. Keep the "
+                    '"version" as fetched.')
     return message, stored
 
 
@@ -610,6 +656,19 @@ def _run_edit_lock(name: str, account: str = "") -> asyncio.Lock:
     return lock
 
 
+async def _caller_gone(ctx: Context | None) -> bool:
+    """Whether the HTTP client that sent this tool call has hung up. The SDK
+    does not cancel a stateless JSON call whose client went, nor can the
+    client's notifications/cancelled reach it (another request, another
+    session): its upload would land after the client gave up, and the
+    client's retry, fetching afresh, would make the change a second time."""
+    try:
+        request = ctx.request_context.request
+    except (AttributeError, ValueError):  # no request: stdio
+        return False
+    return isinstance(request, Request) and await request.is_disconnected()
+
+
 @asynccontextmanager
 async def _run_structure(ctx: Context, name: str, *, upload: bool = False, confirm_removal: bool = False,
                          confirm_hint: str = "remove them with remove_run_unit(name, position, confirm_removal=true)"):
@@ -640,6 +699,8 @@ async def _run_structure(ctx: Context, name: str, *, upload: bool = False, confi
         if upload and store[name] is not fetched:
             if store[name] == fetched:
                 uploaded.append(f"Run '{name}' is unchanged: nothing was uploaded to formr.")
+            elif await _caller_gone(ctx):
+                raise ValueError(f"Run '{name}': the client hung up before the upload: nothing was uploaded.")
             else:
                 message, _ = await _upload_structure(client, name, store[name], confirm_removal=confirm_removal,
                                                      confirm_hint=confirm_hint,
@@ -670,7 +731,7 @@ def _verify_upload(name: str, sent: dict, stored: dict) -> None:
         )
 
 
-@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False, openWorldHint=False))
 async def update_run_structure_from_file(name: RunName, confirm_removal: bool = False, ctx: Context = None) -> str:
     """Read a run structure from .formr/<name>.json, validate, and upload to formr.
 
@@ -720,10 +781,11 @@ async def get_run_structure(name: RunName, ctx: Context = None) -> str:
     """
     validate_run_name(name)
     structure = await _client(ctx).get_run_structure(name)
-    return json.dumps(structure, indent=2, ensure_ascii=False)
+    # compact: C encoder, and ~1/3 fewer characters for the model to read
+    return json.dumps(structure, ensure_ascii=False, separators=(",", ":"))
 
 
-@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False, openWorldHint=False))
 async def update_run_structure(name: RunName, structure_json: str, confirm_removal: bool = False,
                                ctx: Context = None) -> str:
     """Validate a run structure passed as JSON text and upload it to formr.
@@ -870,7 +932,7 @@ async def add_run_unit(name: RunName, unit_type: str, position: int, description
     """Add a unit to a run structure. Locally the file must exist (fetch with get_run_structure_to_file first); a hosted server edits the run in formr, validated and uploaded in one step.
 
     unit_fields — unit-type-specific fields (see get_unit_types() for full schema):
-      Branch/SkipForward/SkipBackward: condition (R expr), if_true (int position)
+      SkipForward/SkipBackward: condition (R expr), if_true (int position)
       Email: subject, body, account_id (int), recipient_field
       Survey: study_id (int) or survey_data (dict)
       Form: study_id (int) — a study on form_v2 (its rendering_mode decides; placing it changes nothing)
@@ -888,10 +950,22 @@ async def add_run_unit(name: RunName, unit_type: str, position: int, description
     confirm_removal=True: tell the user, and pass it only with their go-ahead.
     """
     validate_run_name(name)
+    fields = dict(unit_fields or {})
+    # what the unit is and where it goes are this tool's own arguments (and a
+    # run_unit_id is formr's): set in unit_fields they clashed with them, or
+    # turned the unit into another type or placement
+    taken = sorted(k for k in fields if k in ("type", "run_unit_id", "position", "insert_mode", "name", "unit_type"))
+    if taken:
+        raise ValueError(f"unit_fields may not set {', '.join(taken)}: give unit_type, position and insert_mode "
+                         "as the tool's arguments, and leave run_unit_id to formr.")
+    if "description" in fields:
+        if description and fields["description"] != description:
+            raise ValueError("description is given twice (as an argument and in unit_fields), differently.")
+        description = fields.pop("description")
     async with _run_structure(ctx, name, upload=True, confirm_removal=confirm_removal,
                               confirm_hint="call add_run_unit again with confirm_removal=true") as uploaded:
         result = editing_add_run_unit(name, unit_type, position, description=description,
-                                      insert_mode=insert_mode, **(unit_fields or {}))
+                                      insert_mode=insert_mode, **fields)
     return _with_upload(result, uploaded)
 
 
@@ -1030,8 +1104,9 @@ async def get_session(name: RunName, code: str, ctx: Context = None) -> dict:
     sess = await _client(ctx).get_session(name, code)
     if gate.data_access_mode() == gate.TEST_ONLY and not gate.is_test_session(sess):
         raise gate.DataAccessError(
-            f"Session '{code}' is a real participant; FORMR_DATA_ACCESS=test_only blocks "
-            "reading real participant data. Set FORMR_DATA_ACCESS=all to enable."
+            f"Session '{code[:6]}…' is a real participant's; FORMR_DATA_ACCESS=test_only blocks "
+            "reading real participant data. Only the MCP server's operator can lift that "
+            "(FORMR_DATA_ACCESS=all; FORMR_MCP_DATA_ACCESS in formr-docker), for everyone using it."
         )
     return sess
 
@@ -1063,7 +1138,8 @@ async def get_run_results(name: RunName, surveys: list[str] | None = None,
     GDPR gate: under FORMR_DATA_ACCESS=test_only (default) only test-session rows are returned —
     enforced by resolving test session codes first and passing them as the session filter, since
     the results endpoint has no testing filter of its own. testing=False is refused in test_only
-    mode. Returns {} when no sessions match the constraint. Scope: data:read.
+    mode. Returns {} when no sessions match the constraint. Scope: data:read, and session:read
+    under test_only or with `testing` (the matching sessions are looked up first).
     """
     validate_run_name(name)
     return await gate.get_results_gated(_client(ctx), name, surveys=surveys,
@@ -1114,26 +1190,35 @@ async def create_test_sessions(name: RunName, count: int = 1, codes: list[str] |
     jump to a position, run the engine).
 
     Either `count` random codes (1-50), or your own `codes`, which must match the
-    instance's session-code pattern (by default 64 characters of A-Z a-z 0-9 _ - ~ +).
-    Scope: session:write.
+    instance's session-code pattern (by default 64 characters) and have only A-Z a-z 0-9 _ - ~
+    (formr refuses '+' here). Scopes: session:write and run:read (the run's link).
     """
     validate_run_name(name)
+    if codes and len(codes) > _MAX_NEW_SESSIONS:
+        raise ValueError(f"At most {_MAX_NEW_SESSIONS} codes per call.")
+    if not codes and not 1 <= count <= _MAX_NEW_SESSIONS:
+        raise ValueError(f"count must be between 1 and {_MAX_NEW_SESSIONS}.")
     client = _client(ctx)
+    # the run's link first: read after the sessions were made, a refusal
+    # (no run:read) or a time-out lost their codes, and a retry made more
+    link = (await client.get_run(name)).get("link")
     created: list[str] = []
     errors: list = []
     if codes:
-        if len(codes) > _MAX_NEW_SESSIONS:
-            raise ValueError(f"At most {_MAX_NEW_SESSIONS} codes per call.")
         resp = await client.create_sessions(name, codes=codes, testing=True)
         created = list((resp or {}).get("sessions") or [])
         errors = list((resp or {}).get("errors") or [])
     else:
-        if not 1 <= count <= _MAX_NEW_SESSIONS:
-            raise ValueError(f"count must be between 1 and {_MAX_NEW_SESSIONS}.")
         for _ in range(count):
-            resp = await client.create_sessions(name, testing=True)
+            try:
+                resp = await client.create_sessions(name, testing=True)
+            except (FormrClientError, httpx.HTTPError) as e:
+                if not created:
+                    raise
+                # the ones made so far exist: hand their codes over
+                errors.append({"code": None, "reason": f"stopped after {len(created)} of {count}: {e}"})
+                break
             created.extend((resp or {}).get("sessions") or [])
-    link = (await client.get_run(name)).get("link")
     out: dict = {"created": [{"code": c, "test_link": _test_link(link, c)} for c in created]}
     if errors:
         out["errors"] = errors
@@ -1153,17 +1238,34 @@ async def test_session_action(name: RunName, code: str,
       end_external      end the current External unit, as its service's callback would
 
     Refuses real participants' sessions, whatever FORMR_DATA_ACCESS allows. Returns formr's
-    answer and the session afterwards (position, current unit). Scope: session:write.
+    answer and the session afterwards (position, current unit). Scopes: session:write and
+    session:read.
     """
     validate_run_name(name)
     if action == "move_to_position" and position is None:
         raise ValueError("move_to_position needs a position.")
     client = _client(ctx)
     await _require_test_session(client, name, code)
-    resp = await client.session_action(
-        name, code, action, position=position if action == "move_to_position" else None
-    )
-    return {"action": action, "response": resp or "ok", "session": await client.get_session(name, code)}
+    try:
+        resp = await client.session_action(
+            name, code, action, position=position if action == "move_to_position" else None
+        )
+    except FormrClientError as e:
+        # as in _upload_structure: a lost answer may come after formr did it
+        if isinstance(e, FormrAnswerLost) or e.status in (502, 503, 504):
+            raise ValueError(
+                f"Session '{code}': the answer to '{action}' was lost ({e}). formr may have done it: "
+                "check the session (get_session) before repeating it, or it is done twice."
+            ) from e
+        raise
+    out: dict = {"action": action, "response": resp or "ok"}
+    try:
+        out["session"] = await client.get_session(name, code)
+    except (FormrClientError, httpx.HTTPError) as e:
+        out["session"] = None
+        out["note"] = (f"formr did '{action}', but reading the session back failed ({e}). "
+                       "Do not repeat it: check the session with get_session.")
+    return out
 
 
 # --- logs ---
@@ -1184,19 +1286,22 @@ async def get_run_logs(name: RunName, kind: Literal["unit", "email", "push"] = "
       push   the Push log: message, status, error, attempt
 
     Filters: session (comma-separated codes), testing, since (ISO 8601); limit/offset page
-    through the rows before only_with_log is applied. FORMR_DATA_ACCESS=test_only (default)
-    restricts every kind to test sessions. Email and push logs need a formr with the logs
-    endpoint (v2 line after rc12); the unit log's result_log likewise. Scopes: session:read
-    and data:read.
+    through the rows before only_with_log is applied; an answer with next_offset had a full
+    page, so call again from there. FORMR_DATA_ACCESS=test_only (default) restricts every
+    kind to test sessions. Email and push logs need a formr with the logs endpoint (not in
+    v2.0.0-rc13); the unit log's result_log likewise. Scopes: session:read and data:read.
     """
     validate_run_name(name)
     effective = gate.resolve_testing(testing)
     client = _client(ctx)
     note = None
+    page_full = False
     if kind == "unit":
         rows = await client.get_unit_sessions(name, session=session, testing=effective,
                                               since=since, limit=limit, offset=offset,
                                               include_log=True)
+        # formr pages before only_with_log is applied (its limit clamped to 1..10000)
+        page_full = len(rows or []) >= min(max(limit, 1), 10000)
         if rows and not any("result_log" in r for r in rows if isinstance(r, dict)):
             note = ("This formr does not return result_log yet (it ignores include_log); "
                     "only results are shown.")
@@ -1207,7 +1312,9 @@ async def get_run_logs(name: RunName, kind: Literal["unit", "email", "push"] = "
             rows = await client.get_logs(name, kind, session=session, testing=effective,
                                          since=since, limit=limit, offset=offset)
         except FormrClientError as e:
-            if "-> 404" in str(e) and "logs" in str(e):
+            # formr without the endpoint: 'Run sub-resource not found'; with
+            # it, a 404 for a run that doesn't exist says so ('Run not found')
+            if e.status == 404 and "sub-resource" in str(e):
                 raise FormrClientError(
                     f"This formr instance has no {kind} log endpoint yet "
                     f"(GET /api/v1/runs/{{name}}/logs/{kind}); it needs a newer formr."
@@ -1220,14 +1327,18 @@ async def get_run_logs(name: RunName, kind: Literal["unit", "email", "push"] = "
     out: dict = {"kind": kind, "count": len(rows), "rows": rows}
     if note:
         out["note"] = note
+    if page_full:
+        out["next_offset"] = offset + min(max(limit, 1), 10000)
+        out["more"] = (f"formr's page of unit sessions was full: later ones, logged ones included, "
+                       f"are not in this answer. Call again with offset={out['next_offset']}.")
     return out
 
 
 # --- run files (write) ---
 
-@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True, openWorldHint=False))
 async def upload_run_file(name: RunName, path: str | None = None, filename: str | None = None,
-                          text: str | None = None, content_base64: str | None = None,
+                          text: str = "", content_base64: str = "",
                           ctx: Context = None) -> dict:
     """Upload a file to a run (an image, a CSS or JS file, a PDF, a CSV the run's R reads)
     and return its entry with the URL to use in the run. Give exactly one of:
@@ -1239,10 +1350,13 @@ async def upload_run_file(name: RunName, path: str | None = None, filename: str 
 
     formr keeps letters, digits, '.', '_' and '-' of the name and replaces the rest with
     '_'; it refuses file types it doesn't take. An existing file of that name is replaced.
-    Scope: file:write.
+    Scope: file:write (and file:read for the file's URL in the answer).
     """
     validate_run_name(name)
-    given = [x for x in (path, text, content_base64) if x is not None]
+    # text and content_base64 are plain `str`: the SDK reads any other
+    # annotation's string as JSON first, so a file whose text is a JSON object
+    # or array arrived as a dict and was refused, and 'null' as None
+    given = [x for x in (path, text, content_base64) if x]
     if len(given) != 1:
         raise ValueError("Give exactly one of path, text or content_base64.")
     if path is not None:
@@ -1254,7 +1368,7 @@ async def upload_run_file(name: RunName, path: str | None = None, filename: str 
     else:
         if not filename:
             raise ValueError("filename is required with text or content_base64.")
-        if text is not None:
+        if text:
             content = text.encode("utf-8")
         else:
             try:
@@ -1265,10 +1379,17 @@ async def upload_run_file(name: RunName, path: str | None = None, filename: str 
     client = _client(ctx)
     resp = await client.upload_run_file(name, filename, content, content_type)
     stored = (resp or {}).get("file") or filename
-    entry = next((f for f in (await client.get_run_files(name) or [])
-                  if isinstance(f, dict) and f.get("name") == stored), None)
-    return {"file": stored, "bytes": len(content), "messages": (resp or {}).get("messages"),
-            "entry": entry}
+    out: dict = {"file": stored, "bytes": len(content), "messages": (resp or {}).get("messages"),
+                 "entry": None}
+    try:
+        files = await client.get_run_files(name) or []
+    except (FormrClientError, httpx.HTTPError) as e:
+        # stored all the same (a 403 here is a token without file:read)
+        out["note"] = (f"Stored. Listing the run's files for its URL failed ({e}); "
+                       "list_run_files shows it; no need to upload it again.")
+        return out
+    out["entry"] = next((f for f in files if isinstance(f, dict) and f.get("name") == stored), None)
+    return out
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True, openWorldHint=False))
@@ -1318,6 +1439,9 @@ async def fetch_google_sheet(
     """
     if HTTP_MODE and (to_file or format == "xlsx"):
         raise ValueError("A hosted MCP server has no workspace to write the sheet to: fetch it as CSV text (format='csv', to_file=False).")
+    if HTTP_MODE:
+        return await gsheets.fetch_google_sheet(url, format, to_file, http_client=shared_http(),
+                                                max_bytes=gsheets.MAX_SHEET_BYTES)
     return await gsheets.fetch_google_sheet(url, format, to_file)
 
 

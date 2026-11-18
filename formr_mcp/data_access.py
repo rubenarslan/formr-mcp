@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 from typing import TYPE_CHECKING
+from urllib.parse import quote_plus
 
 if TYPE_CHECKING:
     from .client import FormrClient
@@ -65,8 +66,9 @@ def resolve_testing(requested: bool | None) -> bool | None:
             raise DataAccessError(
                 "This MCP is configured FORMR_DATA_ACCESS=test_only; real "
                 "participant data is not accessible. Only test sessions "
-                "(testing=1) can be read. Set FORMR_DATA_ACCESS=all on the "
-                "MCP server and restart to enable real-data access."
+                "(testing=1) can be read. Only the MCP server's operator can lift that "
+                "(FORMR_DATA_ACCESS=all; FORMR_MCP_DATA_ACCESS in formr-docker), for "
+                "everyone using it."
             )
         # None (both) or True (test) both collapse to "test only".
         return True
@@ -118,11 +120,56 @@ async def get_results_gated(
     if sessions:
         allowed_set = set(allowed)
         allowed = [s for s in sessions if s in allowed_set]
+    allowed = list(dict.fromkeys(allowed))
     if not allowed:
         # No sessions match the constraint (e.g. no test sessions yet) —
         # return the empty shape rather than calling /results unfiltered
         # (an empty `sessions` filter would return ALL sessions).
         return {}
-    return await client.get_results(
-        run, surveys=surveys, sessions=allowed, items=items
-    )
+    merged: dict = {}
+    for batch in _code_batches(allowed):
+        answer = await client.get_results(run, surveys=surveys, sessions=batch, items=items)
+        for key, rows in _only_codes(answer, set(batch)).items():
+            merged.setdefault(key, []).extend(rows)
+    return merged
+
+
+# formr's Apache refuses a request line over 8190 bytes (414), httpx a query
+# over 65536 characters (InvalidURL): the codes go to /results in batches whose
+# `sessions` value as httpx encodes it (quote_plus, the comma as %2C) stays under
+# this (89 codes of 64 plain characters), leaving ~2 KB for the base path, the
+# run name and surveys/items.
+_SESSIONS_PARAM_BYTES = 6000
+
+
+def _code_batches(codes: list[str]) -> list[list[str]]:
+    batches: list[list[str]] = []
+    batch: list[str] = []
+    size = 0
+    for code in codes:
+        cost = len(quote_plus(code, safe="")) + 3
+        if batch and size + cost > _SESSIONS_PARAM_BYTES:
+            batches.append(batch)
+            batch, size = [], 0
+        batch.append(code)
+        size += cost
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+def _only_codes(answer: object, codes: set[str]) -> dict:
+    """formr's /results answer with only the rows of `codes`. formr matches each
+    `sessions` entry as a case-insensitive prefix (ApiBase::getSurveyResults and
+    getShuffleResults: `session LIKE 'code%'`), so it also returns sessions whose
+    code merely begins with an allowed one: under test_only a real participant's
+    whose code begins with a test session's. Survey rows carry the code in
+    `session`, the `shuffles` rows in `run_session`."""
+    if not isinstance(answer, dict):
+        raise DataAccessError("formr's /results answer was not an object; none of it is returned.")
+    kept: dict = {}
+    for key, rows in answer.items():
+        field = "run_session" if key == "shuffles" else "session"
+        kept[key] = ([r for r in rows if isinstance(r, dict) and r.get(field) in codes]
+                     if isinstance(rows, list) else [])
+    return kept

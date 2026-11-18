@@ -58,7 +58,7 @@ upload it in one step, and `get_run_structure_to_file`,
 | --- | --- |
 | `FORMR_BASE_URL` | formr's admin origin, the issuer (e.g. `https://formr.example.org`) |
 | `MCP_PUBLIC_URL` | this server's address, formr's `mcp_url` (e.g. `https://formr.example.org/mcp`); it answers only requests for this host |
-| `FORMR_DATA_ACCESS` | the ceiling for every researcher: `test_only` (default) or `all` ([Participants' data](#participants-data)) |
+| `FORMR_DATA_ACCESS` | what the read tools pass on, for every researcher: `test_only` (default) or `all` ([Participants' data](#participants-data)) |
 | `MCP_HTTP_HOST`, `MCP_HTTP_PORT` | where it listens (`0.0.0.0`, `8000`) |
 | `MCP_FORWARDED_ALLOW_IPS` | proxies whose `X-Forwarded-*` headers it takes (`*`) |
 | `FORMR_HTTP_TIMEOUT`, `FORMR_MCP_LOG_LEVEL` | as for the local server |
@@ -148,7 +148,8 @@ The read tools (sessions, results, logs, files) pass on what `FORMR_DATA_ACCESS`
 allows, whatever the credential's or connection's scopes: `test_only`, the
 default, only test sessions (`testing=1`); `all`, real participants' too. Per-call
 filters apply within that ceiling and never exceed it; `whoami` reports it. On a
-hosted server the operator sets it for everyone. What the tools return goes to the
+hosted server the operator sets it for everyone. It limits this server's tools, not the
+connection's token, which reads in formr's API whatever its scopes allow. What the tools return goes to the
 AI company that runs the assistant. Run secrets reach it by name only.
 
 ## Changing a live run
@@ -160,7 +161,8 @@ Uploads change only what changed (formr v2.0.0-rc13 and later):
   position changes. A unit without one is new; the editing tools take care of
   this (`duplicate_run_units` drops it from copies).
 - The structure's `version` makes formr refuse an upload made from a copy that
-  changed in formr meanwhile (fetch again).
+  changed in formr meanwhile (fetch again); an upload without it overwrites,
+  unchecked.
 - A unit left out is removed, and its participants go on from whatever now stands
   in its place. Where real participants are at it, formr refuses the upload until
   it is repeated with `confirm_removal=true` (`remove_run_unit`,
@@ -227,6 +229,10 @@ each formr API request (status, duration); `DEBUG` adds httpx's lines.
 ```bash
 uv run --with pytest pytest tests/
 ```
+
+The tests run offline. `tests/test_integration_runs.py` creates and deletes runs on
+the formr instance of your `.env`; it runs only when asked for:
+`uv run --with pytest pytest -m integration tests/`.
 
 `server.py` defines the tools; `http_server.py` is the hosted entry point
 (token check: `formr_mcp/auth.py`). `formr_mcp/`: `client.py` (formr's API),

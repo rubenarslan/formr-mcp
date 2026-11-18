@@ -16,11 +16,12 @@ from pathlib import Path
 _env_workspace = os.environ.get("FORMR_WORKSPACE_DIR")
 WORKSPACE_DIR = Path(_env_workspace) if _env_workspace else Path(".formr")
 
-# Mirror formr's own rule exactly (RunResource.php: /^[a-zA-Z][a-zA-Z0-9-]{2,255}$/)
-# so the MCP is never stricter than the server — formr allows uppercase and up
-# to 256 chars. Reserved-name checks are left to formr (being more permissive
-# here just defers to its server-side validation).
-VALID_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{2,255}$")
+# A run's name as formr stores it: a new one takes formr's Run::NAME_PATTERN
+# (letters, digits, hyphens, 3-45 characters, which survey_runs.name holds); one
+# made under older rules may keep underscores (Run::linkedName), and the tools
+# must reach it. Reserved names are left to formr.
+VALID_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{2,44}\Z")
+VALID_NEW_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{2,44}\Z")
 
 
 # formr's SurveyStudy::NAME_PATTERN: a survey is named after its file, so
@@ -38,16 +39,27 @@ def validate_survey_name(name: str) -> None:
 
 
 def validate_run_name(name: str) -> None:
-    """Validate a run name. Raises ValueError if invalid.
+    """Validate the name of an existing run. Raises ValueError if invalid.
 
-    Name must start with a letter (a-z or A-Z), contain only letters, digits,
-    and hyphens, and be 3-256 characters long.
+    It starts with a letter (a-z or A-Z), has only letters, digits, hyphens
+    and (a run named before 2018) underscores, and 3-45 characters.
     """
-    if not VALID_NAME.match(name):
+    if not isinstance(name, str) or not VALID_NAME.match(name):
         raise ValueError(
             f"Invalid run name '{name}'. "
-            f"Name must start with a letter (a-z or A-Z), contain only letters, "
-            f"digits, and hyphens, and be 3-256 characters long."
+            f"A run's name starts with a letter (a-z or A-Z), has only letters, "
+            f"digits and hyphens, and is 3-45 characters long."
+        )
+
+
+def validate_new_run_name(name: str) -> None:
+    """Validate a new run's name as formr does (Run::NAME_PATTERN): a letter,
+    then letters, digits and hyphens, 3-45 characters. Raises ValueError."""
+    validate_run_name(name)
+    if not VALID_NEW_NAME.match(name):
+        raise ValueError(
+            f"Invalid run name '{name}'. A new run's name starts with a letter and has "
+            f"only letters, digits and hyphens (no underscores), 3-45 characters."
         )
 
 
@@ -59,7 +71,7 @@ def safe_run_filepath(name: str) -> Path:
     validate_run_name(name)
     path = (WORKSPACE_DIR / f"{name}.json").resolve()
     workspace_resolved = WORKSPACE_DIR.resolve()
-    if not str(path).startswith(str(workspace_resolved)):
+    if not path.is_relative_to(workspace_resolved):
         raise ValueError("Path traversal detected: file path escapes workspace directory")
     return path
 

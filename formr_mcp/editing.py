@@ -140,6 +140,19 @@ def _build_unit(unit_type: str, position: int, **kwargs) -> dict:
     return unit
 
 
+def _same_survey(replaced: dict, fields: dict) -> bool:
+    """Whether an overwrite of a Survey/Form keeps its study: formr keeps the
+    placement only then, and the validator takes a unit with a run_unit_id
+    for a survey formr has (its use_paging is formr's to keep). Another study
+    is a new unit (whose use_paging the validator checks). Other units: True."""
+    new = fields.get("survey_data")
+    if not isinstance(new, dict):
+        return True
+    old = replaced.get("survey_data")
+    old_name = old.get("name") if isinstance(old, dict) else None
+    return old_name is not None and new.get("name") == old_name
+
+
 def _unit_kind(unit_type: str | None) -> str | None:
     """formr's "same kind of unit" for a placement it keeps (Run::isSamePlacedUnit):
     a Page and an Endpage are one, so are a Survey and a Form (the study decides)."""
@@ -164,7 +177,9 @@ _NEW_UNIT_FIELDS: dict[str, dict[str, Any]] = {
     "Shuffle": {"groups": 2},
     "Privacy": {"privacy_label": "", "tos_label": ""},
 }
-_NEW_UNIT_FIELDS["Wait"] = _NEW_UNIT_FIELDS["Pause"]
+# a Wait's body is the position a participant who comes back early is sent
+# to (none: formr stores NULL for '' too), not a Pause's text
+_NEW_UNIT_FIELDS["Wait"] = dict(_NEW_UNIT_FIELDS["Pause"], body=None)
 _NEW_UNIT_FIELDS["Endpage"] = _NEW_UNIT_FIELDS["Page"]
 
 
@@ -197,7 +212,8 @@ def add_run_unit(name: str, unit_type: str, position: int, **kwargs) -> str:
             # the same kind of unit, changed: formr saves it in place, and
             # whoever is at it stays (another kind is a new unit; for a
             # survey formr also asks that it is the same study)
-            if replaced and "run_unit_id" in replaced[0] and _unit_kind(replaced[0].get("type")) == _unit_kind(unit_type):
+            if (replaced and "run_unit_id" in replaced[0] and _unit_kind(replaced[0].get("type")) == _unit_kind(unit_type)
+                    and _same_survey(replaced[0], kwargs)):
                 unit["run_unit_id"] = replaced[0]["run_unit_id"]
                 # formr keeps what an upload leaves out of a unit it keeps:
                 # the fields not given get a new unit's values, so that the
