@@ -290,12 +290,15 @@ functions), call list_patterns() then get_pattern(name) to learn the proven appr
 get_documentation("patterns") and get_documentation("custom-r-and-secrets").
 
 DATA ACCESS — survey_unit_sessions / survey data frames = current participant only.
-For all-participant data: formr_api_authenticate() with NO ARGUMENTS works in ALL run
-R contexts (conditions, item values/showif, labels, page/email bodies, External units)
-— formr auto-injects a run-scoped token (180 s, data:read). Exception: email subjects
-/ push titles (plaintext, no R eval). For a DIFFERENT run: store credentials as run
-secrets and pass them explicitly. Never use formr_connect() / formr_raw_results().
-See get_documentation("data-access").""",
+For all-participant data: call formr_api_authenticate() with NO ARGUMENTS in the run's R
+(conditions, item value/showif/label, Pause relative_to, page/email bodies, External units).
+formr injects a token for that evaluation: the run owner's, this run only, 180 s, scopes
+user:read session:read session:write run:read data:read (read data, move sessions; no
+changes to units, settings or surveys). It is minted only when `formr_api_authenticate(`
+is written in the unit's own code — a call that sits only inside custom_r gets no token.
+Email subjects and push notification titles/texts DO evaluate R, but never get a token.
+For a DIFFERENT run: store credentials as run secrets and pass them explicitly. Never use
+formr_connect() / formr_raw_results(). See get_documentation("data-access").""",
 )
 
 # Log every tool call (name, args, duration, success/error) to stderr.
