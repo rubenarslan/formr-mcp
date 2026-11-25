@@ -184,7 +184,7 @@ All accept `min,max` in type_options (e.g. `2013-01-01,2014-01-01`, `-2years,now
 |------|-------|---------|--------------|-------------|
 | `range` | INT UNSIGNED | **Required** | `min,max,step` (0,100,1) | Slider. `choice1` = left label, `choice2` = right label. Value hidden. |
 | `range_ticks` | INT UNSIGNED | **Required** | `min,max,step` (0,100,1) | Slider with tick marks + tooltip. |
-| `rating_button` | SMALLINT | **Required** | `min,max,step` (1,5,1) | Numbered buttons. `choice1` = left label, `choice2` = right label. Choices auto-generated from range. |
+| `rating_button` | SMALLINT | **Required** | `min,max,step` (1,5,1) | Numbered buttons. `choice1` = left label, `choice2` = right label. Buttons generated from the range. Leave `type_options` out for 1,5,1; one number sets the max (`"7"` → 1–7); separate numbers with commas. **Known bug:** an empty-string or non-numeric `type_options` (`""`, or a choice-list name on its own) gives two buttons, 1 and 0; `"1 7"` (no comma) gives a single button. |
 | `visual_analog_scale` | INT UNSIGNED | **Required** | `min,max,step` (0,100,1) | Slider with **no default**: the thumb is hidden and the item submits empty until the participant drags it, so a required VAS really catches "never engaged". Authored exactly like `range` (`choice1` = left pole, `choice2` = right pole). Renders in both v1 and v2. |
 | `sex` | TINYINT UNSIGNED | Optional | — | Male/female buttons. 1 = male, 2 = female. Choices auto-set if absent. |
 
@@ -389,18 +389,24 @@ The `relative_to` field on Pause/Wait units is an **R expression** that determin
 the base timestamp. The unit expires at `base_timestamp + wait_minutes`.
 
 - If `relative_to` is empty and `wait_minutes` is set, the default is
-  `tail(survey_unit_sessions$created, 1)` — the timestamp of the most recent unit session.
+  `tail(survey_unit_sessions$created, 1)` — when the participant reached the pause
+  (for a Wait: the unit before it).
 - If `relative_to` returns a **POSIXct timestamp**, the pause expires at
-  `timestamp + wait_minutes * 60`.
-- If `relative_to` returns **TRUE**, the pause expires immediately.
-- If `relative_to` returns **FALSE**, the pause never expires (waits indefinitely).
-- `wait_until_time` and `wait_until_date` are additional constraints — the pause
-  won't expire until the specified time-of-day and/or date are also met.
+  `timestamp + wait_minutes * 60` (without `wait_minutes`: at the timestamp).
+- If `relative_to` returns **TRUE**, the pause ends now; **FALSE** keeps it waiting, and
+  formr asks again (every 10 min in the first hour, then hourly, after a day every 6 h).
+- **TRUE/FALSE only works with `wait_minutes` empty.** With `wait_minutes` set,
+  `relative_to` must return a date-time; a logical makes the pause fail ("Relative to
+  yields neither a date, nor a time") and notifies the study's admins.
+- With `wait_minutes` set, `wait_until_time`/`wait_until_date` are ignored. Alone,
+  `wait_until_time` waits for that time of day — the next day's if it had already passed
+  when the participant arrived. With a date from `relative_to` it sets the time on that day.
 
-### Common relative_to expressions
+### Common relative_to expressions (TRUE/FALSE: leave `wait_minutes` empty)
 
 ```r
-# Wait until next day 9 AM:
+# At least 12 hours, and not before 9 AM (reached at 20:00 → next day 9 AM; reached at
+# 7:00 → 19:00 the same day). For a plain "next 9 AM", use wait_until_time "09:00:00".
 time_passed(hours = 12) && hour(now()) >= 9
 
 # Wait until 9 AM on the day after the baseline survey:
@@ -408,8 +414,8 @@ library(lubridate)
 time_passed(hours = 1) && hour(now()) >= 9 &&
   date(now()) > as.Date(baseline$created)
 
-# Pause for 3 hours from when SMS was sent:
-tail(survey_unit_sessions$created, 1)
+# A date-time (use WITH wait_minutes, e.g. 180 = 3 hours after the SMS unit at pos. 55):
+tail(survey_unit_sessions[survey_unit_sessions$position == 55, ]$created, 1)
 
 # Check if it's within a time window (for SkipForward conditions):
 hour(now()) >= 9 && hour(now()) < 12
@@ -422,16 +428,18 @@ hour(now()) >= 9 && hour(now()) < 12
 A data frame tracking every unit visit for the **current participant**. Key columns:
 
 > **SCOPE**: Contains ONLY the current participant's rows. To access data across
-> ALL participants, use the formr V1 API anywhere in run R code (see §10 below).
+> ALL participants, use the formr V1 API anywhere in run R code (see §10 in `r-code`).
+
+These are the only columns R gets (no `id`, `result` or session id):
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `id` | int | Unit session ID |
 | `unit_id` | int | Which unit definition |
-| `run_session_id` | int | Which participant run session |
+| `position` | int | The unit's position in the run |
+| `type` | varchar | The unit's type (`Survey` for a Form too) |
 | `created` | datetime | When this unit session was created |
 | `ended` | datetime | When ended (NULL = still active) |
-| `result` | varchar | Human-readable result (e.g., 'survey_started', 'pause_ended') |
+| `expired` | datetime | When it expired (NULL = didn't) |
 
 Common patterns:
 ```r
@@ -459,11 +467,18 @@ Use `survey_run_sessions$session` to construct personalized links for other runs
 
 ### .formr special variables
 
-These are available in R code evaluated by OpenCPU:
-- `.formr$login_code` — the participant's session code (= their login link code)
-- `.formr$last_action_time` — timestamp of the participant's last action
-- `.formr$nr_of_participants` — total number of participants in the run
-- `.formr$secret_<name>` — run secrets (only injected if referenced in code)
+formr supplies each only when the code being evaluated contains it written out:
+- `.formr$login_code` — the participant's session code (= their login link code; `user_id` too)
+- `.formr$login_link` — the participant's personal link to the run
+- `.formr$nr_of_participants` — the number of run sessions: **everyone** who opened the
+  run, including test sessions, drop-outs after the first page and the current participant.
+  For real or finished participants only, use the V1 API (§10 in `r-code`).
+- `.formr$session_last_active` — when the participant was last active
+- `.formr$last_action_time` — when the participant reached the current unit; supplied for
+  `time_passed()` (only when the code contains `time_passed`), so don't read it directly
+- `.formr$run_name`, `.formr$host`, `.formr$access_token` — set only when the code calls
+  `formr_api_authenticate(` (see §10 in `r-code`)
+- `.formr$secret_<name>` — run secrets (only injected if referenced in code or custom_r)
 
 ## Common patterns
 
@@ -613,6 +628,15 @@ opts_chunk$set(warning=FALSE, message=FALSE, error=FALSE, echo=FALSE)
 
 This means `library(formr)` is always available in knitr rendering.
 
+### Email subjects and push notification titles/texts
+
+These are knitted too, as **plain text**: inline `` `r expr` `` is evaluated (with the
+participant's data, custom_r and secrets), e.g. a subject
+`` Day `r nrow(diary) + 1` of your diary ``. What they lack: Markdown/HTML, the
+`{{login_link}}`-style placeholders (an email's body has them, these don't), and the
+API token — a `formr_api_authenticate()` there gets none. Compute API-based values in
+the body.
+
 ### Knitr in email bodies
 
 Email bodies also support knitr. formr renders them as self-contained HTML emails
@@ -632,17 +656,25 @@ The `relative_to` field on Pause/Wait units is an **R expression** that determin
 when the pause expires:
 
 - Returns a **POSIXct timestamp** → pause expires at `timestamp + wait_minutes * 60`
-- Returns **TRUE** → pause expires immediately
-- Returns **FALSE** → pause never expires (waits indefinitely)
-- If empty with `wait_minutes` set → defaults to `tail(survey_unit_sessions$created, 1)`
+  (without `wait_minutes`: at that timestamp)
+- Returns **TRUE** → pause ends now; **FALSE** → keep waiting: formr asks again every
+  10 min in the first hour, then hourly, after a day every 6 hours
+- TRUE/FALSE only works **without** `wait_minutes`. With `wait_minutes` set, relative_to
+  must return a date-time, or the pause fails ("Relative to yields neither a date, nor a
+  time") and the study's admins are notified
+- If empty with `wait_minutes` set → counts from when the participant reached the pause
+  (a Wait: the unit before it)
 
-Common timing patterns:
+Common timing patterns (all TRUE/FALSE, so leave `wait_minutes` empty):
 
 ```r
-# Wait until next day 9 AM:
+# At least an hour, and not before 9 AM. NOT "next morning": reached at 15:00, it ends
+# at ~16:00 the same day.
 time_passed(hours = 1) && hour(now()) >= 9
+# "Next morning at 9" is simpler as wait_until_time "09:00:00" with nothing else set:
+# formr moves it to the next day if 9:00 has passed when the participant arrives.
 
-# Wait 3 hours from when the last unit was visited, only during 9am-10pm:
+# Wait 3 hours from arriving at the pause, then only between 10:00 and 21:59:
 library(lubridate)
 time_passed(minutes = 180) && hour(now()) > 9 && hour(now()) < 22
 
@@ -666,16 +698,18 @@ System columns available in every survey: `created`, `ended`, `modified`.
 
 `survey_unit_sessions` is a system data frame tracking **every unit visit** for the
 **current participant only**. It does NOT contain rows for other participants.
-To access data across all participants, use the formr V1 API anywhere in run R code (§8).
+To access data across all participants, use the formr V1 API anywhere in run R code (§10).
 
-Key columns:
+Its columns (the only ones R gets):
 
 | Column | Description |
 |--------|-------------|
 | `created` | Datetime when this unit session was created |
 | `ended` | When the session ended (NULL = still active) |
-| `position` | Run position of the unit (not in base schema, accessible via joins) |
-| `result` | Human-readable result string |
+| `expired` | When it expired (NULL = didn't) |
+| `position` | Run position of the unit |
+| `type` | The unit's type (`Survey` for a Form too) |
+| `unit_id` | Which unit definition |
 
 Common patterns:
 
@@ -737,19 +771,30 @@ leaking secret values.
 data**. To query data across all participants, use the formr V1 API (`formr_api_*`).
 
 **Auto-injection**: Whenever formr evaluates R code that contains `formr_api_authenticate(`,
-it automatically mints a short-lived OAuth token (180 s, `data:read` scope) for the run
-owner and injects it into `.formr$access_token`, `.formr$host`, and `.formr$run_name`
-before the code runs. Call `formr_api_authenticate()` with **no arguments** — it picks
-up the injected token automatically. No secrets to configure.
+it mints a short-lived OAuth token for the run owner and injects it into
+`.formr$access_token`, `.formr$host`, and `.formr$run_name` before the code runs. Call
+`formr_api_authenticate()` with **no arguments** — it picks up the injected token
+automatically. No secrets to configure. The token:
 
-This works in **all R evaluation contexts within a run**: Branch/SkipForward/SkipBackward
-conditions, survey item `value` and `showif` fields, item and choice `label` knitr
-rendering, Page/Endpage `body` content, Email unit `body` content, and External unit R
-code. The only exception is plaintext evaluation (email subject lines, push notification
-titles), which does not go through the R evaluation pipeline.
+- lasts **180 s** and works **only for this run**;
+- has the scopes `user:read session:read session:write run:read data:read` — it can read
+  the run's data and sessions and move sessions on (`formr_api_session_action()`), but
+  can't change units, settings or surveys;
+- belongs to the run's **owner**, whose account needs API access (admin level 2).
 
-The auto-injected token is **restricted to the current run**. For accessing a different
-run, store credentials as run secrets (§9) and pass them explicitly.
+It works in the R that formr evaluates or knits for a unit: Branch/SkipForward/SkipBackward
+conditions, Pause/Wait `relative_to`, survey item `value` and `showif` fields, item and
+choice `label` knitr rendering, Page/Endpage `body` content, Email unit `body` and
+recipient, External unit R code, and the run's overview script. Two exceptions:
+
+- **Email subjects and push notification titles/texts** evaluate R (knitted as plain
+  text) but never get a token. Compute API-based values in the body.
+- formr looks for `formr_api_authenticate(` in the **unit's own code**, not in the run's
+  `custom_r`. A helper in custom_r that calls the API gets a token only if the code that
+  calls the helper also contains `formr_api_authenticate()`.
+
+For accessing a different run, store credentials as run secrets (§9) and pass them
+explicitly.
 
 ```r
 library(formr)
@@ -757,11 +802,13 @@ library(formr)
 # ── Current run: token auto-injected, no secrets needed ──────────────────────
 formr_api_authenticate()
 
-all_sessions <- formr_api_sessions(.formr$run_name)
-nrow(all_sessions)  # total session count
+# formr_api_sessions() returns at most `limit` rows (default 1000, max 10000)
+all_sessions <- formr_api_sessions(.formr$run_name, limit = 10000)
+nrow(all_sessions)  # session count, test sessions included (testing = FALSE drops them)
 
-all_results <- formr_api_results(.formr$run_name)
-nrow(all_results)   # participants with response data
+# one survey's rows, test sessions removed, a row per time someone got the survey
+intake_all <- formr_api_results(.formr$run_name, surveys = "intake")
+length(unique(intake_all$session))   # real participants with intake answers
 
 # ── Different run: store credentials as run secrets (§9) ──────────────────────
 formr_api_authenticate(
@@ -991,11 +1038,23 @@ The `settings` object (optional) controls survey behavior:
 ```
 
 Most settings default to `0`/`false`. The key ones:
-- `enable_instant_validation` — validate on blur (1) or on submit (0)
-- `add_percentage_points` — show progress bar (%)
-- `displayed_percentage_maximum` — progress bar max
-- `unlinked` — allow anonymous (unlinked) sessions
-- `hide_results` — hide results from participants
+- `enable_instant_validation` — flag an invalid answer as soon as it is entered (1), not
+  only when the participant tries to go on (0). v1 only.
+- `add_percentage_points` / `displayed_percentage_maximum` — the stretch of the progress
+  bar this survey covers, from / to (0–100; default 0 to 100). Two surveys in a row:
+  0–40 and 40–100.
+- `unlinked` — the **researcher** can't link the answers to participants: Show/Export
+  Results and the API give the answers without user codes, session ids or times, in random
+  order, and only test sessions' rows until more than 10 real participants have answered;
+  Detailed Results stay empty, Export Run Data leaves the survey out, and the API returns
+  nothing when asked for specific sessions (so `get_run_results` under `test_only` shows
+  none of it). Inside the run, R (and Email recipients) still see the participant's own
+  answers. Use it for identifying data (e.g. email addresses).
+- `hide_results` — formr stores the answers but the **researcher** can't see or download
+  them (no Show/Export/Detailed Results, left out of Export Run Data, none from the API —
+  including the MCP's `get_run_results`). R inside the run and Email units still use them.
+- `unlinked`, `hide_results` (and `use_paging`) are **one-way**: once 1, neither the UI nor
+  the API can turn them off again. Never set them without the user's explicit go-ahead.
 
 **Forbidden settings:**
 - `use_paging` — Do NOT set this to 1. Custom Paging is a legacy feature that is no longer supported. Use `submit` items in the item list to create page breaks instead. formr applies it only when an upload creates the survey, and can't turn it off again, so an upload is refused that would create a survey with it; a survey that already pages exports it as 1, which an upload may send back unchanged.
@@ -1121,8 +1180,9 @@ Use the `class` field for layout control (same as spreadsheet):
 def _examples():
     return r"""# Example Run Structures
 
-These are working examples from the formr documentation. Use them as reference
-for designing your own runs.
+Examples 1, 2, 4 (Filter), 4 (Reminder), 5 and 6 follow the example runs in formr's
+repository (`documentation/run_components/*.json`, importable on a run's Edit page),
+adapted (shortened, and corrected where noted). Use them as reference for designing your own runs.
 
 ---
 
@@ -1226,7 +1286,7 @@ Random-interval reminders throughout the day.
             "description": "loop the experience sampling",
             "position": 50,
             "condition": "nrow(experience_survey) < 100",
-            "if_true": 30
+            "if_true": 20
         },
         {
             "type": "Endpage",
@@ -1238,13 +1298,22 @@ Random-interval reminders throughout the day.
 }
 ```
 
-**Key**: Uses `relative_to` with `lubridate` for random intervals, and `hour(now())` for time-of-day gating.
+**Key**: Uses `relative_to` with `lubridate` for random intervals, and `hour(now())` for time-of-day gating
+(`hour_now > 9 && hour_now < 22` means 10:00–21:59). The relative_to returns TRUE/FALSE, so
+`wait_minutes` stays empty.
+
+**Corrected:** formr's `Experience_sampling.json` loops back with `if_true: 30` (the Email),
+which skips the Pause and mails the next reminder right after each survey. Loop to the
+Pause (20). Note also that formr re-checks a FALSE `relative_to` every 10 min in the first
+hour, then hourly, so timing is that coarse, and `sample()` runs anew at each check, so
+waits come out shorter than a uniform 5–100 min. For a fixed random delay, draw it once and
+store it (e.g. a `calculate` item in the survey before the Pause), then compare against it.
 
 ---
 
 ## 3. ESM with Wait Units and Reminder (Production Pattern)
 
-This is the production-tested pattern for experience sampling studies.
+A pattern for experience sampling studies (not one of formr's example runs).
 It uses Wait units for click-through windows, Email for cron-sent reminders,
 SkipForward for time-gating, and SkipBackward for daily looping.
 
@@ -1261,7 +1330,6 @@ SkipForward for time-gating, and SkipBackward for daily looping.
             "type": "Pause",
             "description": "wait until next day 9AM before ESM starts",
             "position": 20,
-            "wait_minutes": 600,
             "relative_to": "library(lubridate)\ntime_passed(hours = 1) && hour(now()) >= 9 && date(now()) > as.Date(baseline$created)",
             "body": "## See you tomorrow!\n\nThe ESM phase starts tomorrow at 9:00 AM."
         },
@@ -1310,7 +1378,7 @@ SkipForward for time-gating, and SkipBackward for daily looping.
             "description": "ESM beep 2: wait up to 90 min",
             "position": 55,
             "wait_minutes": 90,
-            "body": 80
+            "body": 65
         },
         {
             "type": "Email",
@@ -1331,21 +1399,7 @@ SkipForward for time-gating, and SkipBackward for daily looping.
             "type": "Pause",
             "description": "overnight pause until next 9AM",
             "position": 70,
-            "wait_minutes": 600,
-            "relative_to": "library(lubridate)\ntime_passed(hours = 1) && hour(now()) >= 9",
-            "body": "See you tomorrow!"
-        },
-        {
-            "type": "Survey",
-            "description": "ESM survey (afternoon, second instance)",
-            "position": 75
-        },
-        {
-            "type": "Pause",
-            "description": "overnight pause (alternate path)",
-            "position": 80,
-            "wait_minutes": 600,
-            "relative_to": "library(lubridate)\ntime_passed(hours = 1) && hour(now()) >= 9",
+            "wait_until_time": "09:00:00",
             "body": "See you tomorrow!"
         },
         {
@@ -1366,6 +1420,12 @@ SkipForward for time-gating, and SkipBackward for daily looping.
         },
         {
             "type": "Endpage",
+            "description": "end of study (loop finished)",
+            "position": 100,
+            "body": "Thank you, you have completed the study!"
+        },
+        {
+            "type": "Endpage",
             "description": "dropout: 24hr inactivity",
             "position": 110,
             "body": "We haven't heard from you in over 24 hours. Thank you for your participation so far."
@@ -1375,11 +1435,17 @@ SkipForward for time-gating, and SkipBackward for daily looping.
 ```
 
 **Key patterns demonstrated:**
+- **Pause timing**: a TRUE/FALSE `relative_to` with `wait_minutes` left empty (pos. 20), and
+  `wait_until_time` alone for "the next 9 AM" (pos. 70: reached in the afternoon, it waits
+  until 9:00 the next day). A logical `relative_to` together with `wait_minutes` makes the
+  Pause fail, and `time_passed(hours = 1) && hour(now()) >= 9` alone ends the same afternoon.
 - **Wait `body` positions**: `body: 45` means "if participant clicks within 90 min, jump to position 45 (survey)"
 - **SkipForward time gates**: skip entire beeps if the time window has passed
 - **`cron_only: 1` on Email**: reminder emails are only sent by the cron daemon, not during participant visits
 - **24-hour dropout**: SkipForward checks `difftime()` against last ESM completion
-- **Loop condition**: SkipBackward checks both completion count and days elapsed since baseline
+- **Loop condition**: SkipBackward checks both completion count and days elapsed since baseline;
+  when it stops looping, participants fall through to the completion Endpage (100), while
+  the dropout SkipForward jumps past it to 110
 
 ---
 
@@ -2113,9 +2179,9 @@ This creates two paths:
 | `description` | string | Description |
 | `body` | **int** | The position number to jump to on click. **NOT display content.** |
 | `wait_minutes` | decimal | Minutes to wait before advancing via cron |
-| `wait_until_time` | string | Time of day HH:MM:SS for additional time gate |
-| `wait_until_date` | string | Date for additional date gate |
-| `relative_to` | string | R expression for dynamic timing (same as Pause) |
+| `wait_until_time` | string | Time of day HH:MM:SS (ignored when `wait_minutes` is set) |
+| `wait_until_date` | string | Date (ignored when `wait_minutes` is set) |
+| `relative_to` | string | R expression for dynamic timing (same as Pause: a date-time, or TRUE/FALSE only with `wait_minutes` empty) |
 
 ### Example: ESM beep with 90-min window
 
@@ -2273,12 +2339,15 @@ SkipForward (time gate) → Wait (click window) → Email (reminder) → Survey
 ## Cross-Participant Data Access (V1 API)
 
 `survey_unit_sessions` and survey data frames contain only the current participant's
-data. The V1 API is available in all R evaluation contexts within a run (conditions,
-item values/showif, labels, page/email bodies, External units) to query all participants.
+data. The V1 API is available in the run's R (conditions, Pause relative_to, item
+value/showif/labels, page/email bodies, External units) to query all participants —
+not in email subjects or push titles/texts, which evaluate R but get no token.
 
-**Auto-injection**: formr injects a token when it detects `formr_api_authenticate(`.
-Call it with **no arguments** for the current run — no secrets needed.
-The auto-token is **run-restricted**; for a different run, pass credentials explicitly.
+**Auto-injection**: formr injects a token when it detects `formr_api_authenticate(` in the
+unit's own code (not only inside custom_r). Call it with **no arguments** for the current
+run — no secrets needed. The auto-token is the run owner's, lasts 180 s, is
+**run-restricted** and has the scopes `user:read session:read session:write run:read
+data:read`; for a different run, pass credentials explicitly.
 
 ```r
 library(formr)
@@ -2391,20 +2460,29 @@ Reach for `formr_api_*` whenever you need to:
 ### A — Inside any R code within a formr run
 
 R code is evaluated by formr's OpenCPU server in many contexts: Branch conditions,
-survey item `value`/`showif` fields, item/choice `label` knitr, Page/Endpage bodies,
-Email bodies, and External unit code. The V1 API is available in all of them.
+Pause/Wait `relative_to`, survey item `value`/`showif` fields, item/choice `label` knitr,
+Page/Endpage bodies, Email bodies, External unit code and the overview script. The V1 API
+is available in all of them.
 
 **formr auto-injects an OAuth token** when it detects `formr_api_authenticate(` in
-the code. It mints a 180 s token (scopes: `data:read session:read session:write run:read`)
-for the run owner and injects it into `.formr$access_token`, `.formr$host`, and
-`.formr$run_name`. Call `formr_api_authenticate()` with **no arguments** — no secrets,
-no setup required.
+the code. It mints a 180 s token (scopes: `user:read session:read session:write run:read
+data:read`) for the run owner (whose account needs API access, admin level 2) and injects
+it into `.formr$access_token`, `.formr$host`, and `.formr$run_name`. Call
+`formr_api_authenticate()` with **no arguments** — no secrets, no setup required. The
+token can read the run's data and sessions and move sessions on, but can't change units,
+settings or surveys.
 
 The auto-token is **run-restricted** (current run only). For a different run, store
-OAuth credentials as run secrets (see §B.2 below) and pass them explicitly.
+OAuth credentials as run secrets (see "Setting up credentials" below) and pass them
+explicitly.
 
-**Exception**: Email subject lines and push notification titles are rendered as
-plaintext — they do not go through R evaluation and cannot use the V1 API.
+**Exceptions**:
+- formr looks for the call in the **unit's own code** (the condition, value, body…), not
+  in the run's `custom_r`. A custom_r helper that calls `formr_api_*` gets a token only
+  when the calling code also contains `formr_api_authenticate()`.
+- **Email subjects and push notification titles/texts** do evaluate R (knitted as plain
+  text, with the participant's data and secrets) but never get a token, so the V1 API
+  fails there. Compute such values in the body instead.
 
 ```r
 library(formr)
@@ -2422,7 +2500,7 @@ formr_api_authenticate(
   client_secret = .formr$secret_api_client_secret,
   host          = .formr$host
 )
-acq <- formr_api_results("acq-run")
+acq <- formr_api_results("acq-run", surveys = "nominate")  # one survey: bare column names
 n_completed <- nrow(acq[!is.na(acq$acq_name_1), ])
 n_completed >= 3   # TRUE/FALSE → branch condition
 ```
@@ -2440,7 +2518,8 @@ this locally to download and analyse data.
 ```r
 library(formr)
 
-# Interactive authentication (stores token in OS keyring)
+# Authenticate (or store the credential once with formr_store_keys() and call
+# formr_api_authenticate(host = ...) without client_id/secret: it reads the OS keyring)
 formr_api_authenticate(
   client_id     = "your-client-id",
   client_secret = "your-client-secret",
@@ -2451,8 +2530,8 @@ formr_api_authenticate(
 results <- formr_api_results("my-diary-run")
 head(results)
 
-# List all sessions with current positions
-sessions <- formr_api_sessions("my-diary-run")
+# List sessions with current positions (default limit 1000, max 10000)
+sessions <- formr_api_sessions("my-diary-run", limit = 10000)
 table(sessions$position)
 ```
 
@@ -2465,20 +2544,34 @@ table(sessions$position)
 
 | Function | Returns | Notes |
 |----------|---------|-------|
-| `formr_api_authenticate()` | token (invisible) | No-args inside External units — token auto-injected |
-| `formr_api_authenticate(client_id, client_secret, host)` | token (invisible) | Explicit creds for RStudio or cross-run access |
-| `formr_api_results("run")` | data.frame | All participants, processed (types recognised, scales aggregated) |
-| `formr_api_fetch_results("run", join=FALSE)` | list of data.frames | Raw unprocessed, one per survey |
-| `formr_api_sessions("run")` | data.frame | All sessions: session code, created, ended, position |
-| `formr_api_session_action("run", session_codes, action)` | invisible | Move/end/toggle sessions; actions: `"end_external"`, `"move_to_position"`, `"toggle_testing"` |
+| `formr_api_authenticate()` | invisible NULL (caches the token) | No args in any run R code that contains the call — token auto-injected |
+| `formr_api_authenticate(client_id, client_secret, host)` | invisible NULL | Explicit creds for RStudio or cross-run access (`host` defaults to rforms.org outside a run) |
+| `formr_api_results("run", surveys = ...)` | data.frame | Processed (types recognised, items reversed, scales aggregated), test sessions removed, surveys joined by `session` |
+| `formr_api_fetch_results("run", join=FALSE)` | data.frame or named list | Raw, test sessions included: one data.frame if one survey comes back and no Shuffle, else a list (one per survey + `shuffles`) |
+| `formr_api_sessions("run", limit = 10000)` | data.frame | Sessions, newest first: `session`, `created`, `ended`, `position`, `testing`, … (default `limit` 1000, max 10000; `active`, `testing` filters) |
+| `formr_api_session_action("run", session_codes, action)` | logical per session | actions: `"end_external"`, `"move_to_position"` (+ `position`), `"toggle_testing"`, `"execute"`, `"advance"` |
+
+**Joined columns get a suffix.** `formr_api_results()` (join = TRUE by default) and
+`formr_api_fetch_results(join = TRUE)` rename every column except `session` to
+`<column>_<survey>` (e.g. `condition_intake`, `created_intake`) whenever **more than one
+table comes back**: more than one survey (without `surveys = ...`, that is all of the run's
+surveys) or a run with a Shuffle that has assigned anyone (its groups come back as
+`shuffle_<position>` columns). Only a single survey in a run without Shuffle assignments
+keeps the bare item names. The join is a full join by `session`, so two surveys with
+several rows per participant (loops) multiply. Ask for one survey and handle the list case:
+
+```r
+d <- formr_api_fetch_results(surveys = "intake", item_names = "prolific_pid")
+if (!is.data.frame(d)) d <- d$intake   # a run with a Shuffle gets a list
+```
 
 ## Setting up credentials
 
-### For External units accessing the current run
+### For R code in the run accessing the current run
 
 No setup required. formr auto-injects a run-scoped token whenever
-`formr_api_authenticate(` appears in the code. Call `formr_api_authenticate()`
-with no arguments.
+`formr_api_authenticate(` appears in the unit's own code (not only in custom_r). Call
+`formr_api_authenticate()` with no arguments.
 
 ### For External units accessing a different run (run secrets)
 
@@ -2501,8 +2594,8 @@ the OS keyring via `formr_store_keys()` to avoid hardcoding.
 ```r
 library(formr)
 formr_api_authenticate()   # auto-injected token, no args needed
-sessions <- formr_api_sessions(.formr$run_name)
-sum(!is.na(sessions$ended))  # participants who finished
+sessions <- formr_api_sessions(.formr$run_name, testing = FALSE, limit = 10000)
+sum(!is.na(sessions$ended))  # real participants who finished (reached a Stop point)
 ```
 
 ### Check if a linked run has a matching entry (cross-run, needs secrets)
@@ -2513,7 +2606,7 @@ formr_api_authenticate(
   client_secret = .formr$secret_api_client_secret,
   host          = .formr$host
 )
-acq <- formr_api_results("acq-run")
+acq <- formr_api_results("acq-run", surveys = "nominate")  # one survey: bare column names
 any(acq$target_code == .formr$login_code, na.rm = TRUE)
 ```
 
@@ -2585,9 +2678,12 @@ pattern gives you the *approach*; you build the units adapted to the run with th
   `"1"` (~1 ms, used to create a page boundary), `"800"`/`"2000"` (ms delay, used for
   polling), `"auto"` (submit as soon as a choice is made). On a `number` item it means
   `"min,max,step"`. Same field, different meaning per item type.
-- **`formr_api_fetch_results(surveys = c(...), join = TRUE)` renames columns** to
-  `<item>_<survey>`. Reference the renamed columns in your R, and count only completed
-  participants when balancing.
+- **A join renames columns** to `<item>_<survey>`: `formr_api_results()` and
+  `formr_api_fetch_results(join = TRUE)` suffix every column but `session` whenever more
+  than one table comes back (more than one survey, which is all of the run's surveys if you
+  don't pass `surveys`, or a run whose Shuffle has assigned anyone). Name the survey(s) you
+  need, reference the renamed columns in your R, and count only completed participants
+  when balancing.
 
 See also `custom-r-and-secrets` for the run-level R function store and encrypted secrets.
 """
@@ -2626,14 +2722,13 @@ is_done <- function(ended_col) {
 is_done(VIBE_SQ1_ready$ended)   # pass the column in; the function can't see it otherwise
 ```
 
-**`formr_api_authenticate()` does NOT work in `custom_r`.** The
-auto-injected OAuth token (see `data-access`) is only available inside
-**unit-level** R evaluation contexts: branch conditions, item `value`/`showif`,
-labels, bodies, and External unit code. `custom_r` is sourced separately at
-run boot and does not go through the token-minting pipeline. If you need
-cross-participant data access, put `formr_api_authenticate()` in a
-`calculate` item's `value` instead — formr sees the call there and injects
-the token.
+**A `formr_api_authenticate()` that is only in `custom_r` gets no token.** custom_r is
+prepended to every evaluation, but formr decides whether to mint the auto-injected OAuth
+token (see `data-access`) by looking for `formr_api_authenticate(` in the **unit's own
+code** only (the condition, `value`, `showif`, label, body, External code). So write
+`formr_api_authenticate()` in the code that calls your helper, e.g. a calculate's value
+`formr_api_authenticate(); count_done()`; the helper's `formr_api_*` calls then use that
+token. (Secrets differ: formr does look in custom_r for `.formr$secret_<name>`.)
 
 Good candidates to factor out: the long `exists()/is.null()/length()/is.na()` guards that
 appear in many conditions, `safe_parse_json()` for JSON-state stores, phone-number

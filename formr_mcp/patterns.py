@@ -14,9 +14,11 @@ Patterns are mined from real working runs in ``improvement_materials/``. Two con
   ``"1"`` (~1 ms, used to create a page boundary), ``"800"``/``"2000"`` (ms delay, polling),
   ``"auto"`` (submit as soon as a choice is made). On a ``number`` item it means
   ``"min,max,step"``. Same field, different meaning per item type.
-* ``formr_api_fetch_results(surveys = c(...), join = TRUE)`` renames columns to
-  ``<item>_<survey>``. Reference the renamed columns, and count only completed participants
-  when balancing.
+* A join renames columns: ``formr_api_results()`` and ``formr_api_fetch_results(join = TRUE)``
+  suffix every column but ``session`` as ``<item>_<survey>`` whenever more than one table comes
+  back (more than one survey, which is all of the run's surveys if ``surveys`` is not given, or
+  a run whose Shuffle has assigned anyone). Name the survey(s) you need and reference the
+  columns accordingly; count only completed participants when balancing.
 """
 
 from __future__ import annotations
@@ -56,8 +58,12 @@ scaled_age    <- (age - est_age_mean) / est_age_sd
 scaled_weight <- (weight - est_weight_mean) / est_weight_sd
 
 # Fetch all prior participants' covariates + the JSON state stored in bwd_result.
+# Name the survey: without `surveys` every survey of the run comes back, and a join would
+# rename the columns to age_<survey>, ...
 past_data <- suppressMessages(formr_api_fetch_results(
-  run_name = .formr$run_name, item_names = c("bwd_result", "age", "weight"), join = TRUE))
+  run_name = .formr$run_name, surveys = "intake",   # the survey holding these items
+  item_names = c("bwd_result", "age", "weight")))
+if (!is.data.frame(past_data)) past_data <- past_data$intake   # a run with a Shuffle gets a list
 past_data$age    <- (past_data$age    - est_age_mean)    / est_age_sd     # SAME estimates!
 past_data$weight <- (past_data$weight - est_weight_mean) / est_weight_sd
 
@@ -72,8 +78,11 @@ result$json_result  # return the JSON state; formr stores it back into this calc
 _R_LIVE_COUNT = """library(dplyr)
 formr_api_authenticate()
 
-tally <- formr_api_fetch_results(run_name = .formr$run_name, item_names = "item", join = TRUE) |>
-  count(item, name = "Count") |> rename(Answer = item)
+# Name the survey ("poll" here): with several surveys or a Shuffle, a join would
+# rename `item` to item_<survey>.
+votes <- formr_api_fetch_results(run_name = .formr$run_name, surveys = "poll", item_names = "item")
+if (!is.data.frame(votes)) votes <- votes$poll   # a run with a Shuffle gets a list
+tally <- votes |> count(item, name = "Count") |> rename(Answer = item)
 
 dog <- sum(tally$Count[tally$Answer == "dog"], na.rm = TRUE)
 cat <- sum(tally$Count[tally$Answer == "cat"], na.rm = TRUE)
@@ -83,8 +92,9 @@ _R_KNITR_IN_LABEL = """<!-- A knitr chunk placed directly in a NOTE label render
 ```{r warning=FALSE, message=FALSE, error=TRUE, echo=FALSE}
 library(dplyr); library(ggplot2)
 formr_api_authenticate()
-df <- formr_api_fetch_results(run_name = .formr$run_name, item_names = "item", join = TRUE) |>
-  count(item, name = "Count") |> rename(Answer = item)
+votes <- formr_api_fetch_results(run_name = .formr$run_name, surveys = "poll", item_names = "item")
+if (!is.data.frame(votes)) votes <- votes$poll   # a run with a Shuffle gets a list
+df <- votes |> count(item, name = "Count") |> rename(Answer = item)
 knitr::kable(df)                       # a live table, or:
 ggplot(df, aes(as.factor(Answer), Count)) + geom_col(fill = "steelblue") + theme_minimal()
 ```"""
@@ -240,7 +250,7 @@ _PATTERNS: list[dict] = [
         ),
         "key_r": [{"label": "calculate `group`", "code": _R_BALANCED_ASSIGNMENT}],
         "gotchas": [
-            "join=TRUE renames columns to <item>_<survey> — reference df$group_group_selector, not df$group. This trips up nearly everyone.",
+            "A join renames columns to <item>_<survey> whenever more than one table comes back (several surveys, or a run whose Shuffle has assigned anyone) — reference df$group_group_selector, not df$group. This trips up nearly everyone.",
             "Count only COMPLETED participants or drop-outs bias the cells.",
             "`current(survey$item)` reads from a DIFFERENT survey in the same run; a bare variable only works on the calculate's own page.",
         ],
@@ -351,7 +361,7 @@ _PATTERNS: list[dict] = [
         ),
         "key_r": [{"label": "Email body", "code": _R_EMAIL_GREETING}],
         "gotchas": [
-            "Email SUBJECTS are plaintext — inline R (`` `r ...` ``) only works in the BODY.",
+            "Inline R (`` `r ...` ``) works in the SUBJECT too (knitted as plain text), but the subject gets no Markdown, no {{login_link}}-style placeholders and no API token: formr_api_*() calls belong in the BODY.",
             "Use the {{login_link}} placeholder; don't hand-build the link.",
             "A wrong account_id is a common silent failure.",
             "Don't use formr_connect()/formr_raw_results() — deprecated.",
